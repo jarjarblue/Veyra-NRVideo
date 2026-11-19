@@ -115,9 +115,9 @@ def main():
         target.parent.mkdir(exist_ok=True)
         if path != target:
             shutil.copyfile(path, target)
-    xess = sdk('intel/xess', '5ec517a49a1ba8c4ad640361e4eb5227bf0742a5', 'xess',
+    xess = sdk('intel/xess', '8fe81bdbbaf00b3c1b733fd0d830c333dc84e6f0', 'xess',
                lambda p: p.startswith('inc/') or p.lower().startswith('license'))
-    nvenc = sdk('FFmpeg/nv-codec-headers', '57f8cc0bb68e5f16f3787ea92cea59000f7bf97f', 'nvenc',
+    nvenc = sdk('FFmpeg/nv-codec-headers', 'e844e5b26f46bb77479f063029595293aa8f812d', 'nvenc',
                 lambda p: p.startswith('include/') or p.lower().startswith('license'))
     amf = sdk('GPUOpen-LibrariesAndSDKs/AMF', '57ee0cfb0e1a08d9041f77435653794c1b012be0', 'amf',
               lambda p: p.startswith('amf/public/include/') or p.lower().startswith('license'))
