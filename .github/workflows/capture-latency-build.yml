@@ -1,0 +1,67 @@
+name: PS5 capture XeSS latency test build
+on:
+  push:
+    branches: ['codex/ps5-xess-latency-build']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: capture-latency-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          persist-credentials: false
+      - name: Apply reviewed release-source patch
+        run: |
+          git apply --check scripts/ci/latency-source.patch
+          git apply scripts/ci/latency-source.patch
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005
+        with:
+          version: '6.8.3'
+          arch: 'win64_msvc2022_64'
+          cache: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            out/capture-ci/downloads
+            out/capture-ci/deps
+          key: veyra-capture-dependencies-v1
+      - name: Prepare pinned dependencies and configure
+        run: python scripts/ci/prepare-capture-build.py
+      - name: Build Windows application and focused tests
+        timeout-minutes: 15
+        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_anti_lag_tests veyra_xess_fallback_tests veyra_qml_quick_tests
+      - name: Run latency contracts
+        run: |
+          out/capture-ci/build/veyra_anti_lag_tests.exe
+          out/capture-ci/build/veyra_xess_fallback_tests.exe
+          python -B scripts/i18n/extract.py --check
+      - name: Test latency controls with Qt Quick
+        env:
+          QT_QUICK_BACKEND: software
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          Copy-Item -Recurse tests/qml/quick out/capture-ci/build/qml-tests
+          out/capture-ci/build/veyra_qml_quick_tests.exe AmdLatencyOwnership::test_defaults_and_shared_preference AmdLatencyOwnership::test_xess_never_offers_stacked_anti_lag AmdLatencyOwnership::test_provider_owned_disables_native_control
+      - name: Stage runnable capture test package
+        run: python scripts/ci/stage-capture-build.py
+      - name: Upload test package and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Veyra-2.1.9-AMD-Capture-Latency-Test
+          path: |
+            out/capture-ci/package.zip
+            out/capture-ci/options.json
+            out/capture-ci/build/CMakeFiles/CMakeConfigureLog.yaml
+            out/capture-ci/BUILD_RESULT.json
+          if-no-files-found: warn
+          retention-days: 7

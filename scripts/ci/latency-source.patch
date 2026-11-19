@@ -1,0 +1,1452 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d5bd7ca..10c1cc2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -114,7 +114,16 @@ target_compile_features(veyra_logger_tests PRIVATE cxx_std_20)
+ target_link_libraries(veyra_logger_tests PRIVATE veyra_base)
+ veyra_apply_warnings(veyra_logger_tests)
+ 
++# Driver-independent lifecycle and 30 -> 120 fallback cadence contracts.
++add_executable(veyra_anti_lag_tests tests/unit/AntiLagSessionTests.cpp)
++add_executable(veyra_xess_fallback_tests tests/unit/XessFallbackCadenceTests.cpp)
++foreach(test_target veyra_anti_lag_tests veyra_xess_fallback_tests)
++  target_compile_features(${test_target} PRIVATE cxx_std_20)
++  target_include_directories(${test_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
++endforeach()
++
+ add_library(veyra_gfx STATIC
++  src/gfx/AntiLagSession.cpp
+   src/gfx/GpuSchedulingPriority.cpp
+   src/gfx/NvidiaVrrProfile.cpp
+   src/gfx/D3D12DeviceContext.cpp
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index dfdb305..4e56ed3 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -1122,3 +1122,13 @@ Runtime path: `media/startup-music.mp3`, 1847011 bytes, SHA256
+ `3005aa601f06a97d3968fd9fa171e870fceb4ec47586f1e950c9ed3c7875fb6a`.
+ Each runnable package includes its separate notice and manifest. Windows Media
+ Foundation provides decoding; no additional codec or audio SDK is bundled.
++
++## AMD Radeon Anti-Lag 2 SDK (local integration, 2026-11-19)
++
++GPUOpen-LibrariesAndSDKs/AntiLag2-SDK, fixed commit
++`390aa4a8c8655d0ae6e90079db2c85e103a96da3`, MIT. The unmodified DirectX 12
++header and full license are retained under `third_party/amd-anti-lag-2/`, with
++source identity in `UPSTREAM.json`. Veyra adds its own lifecycle adapter and
++opt-in preference. The SDK uses the already-loaded AMD driver interface; no
++AMD driver DLL is included. XeSS presentation keeps XeLL and never stacks this
++additional latency controller.
+diff --git a/docs/AMD_ANTILAG_XESS_LATENCY_2026-11-19.md b/docs/AMD_ANTILAG_XESS_LATENCY_2026-11-19.md
+new file mode 100644
+index 0000000..3578b72
+--- /dev/null
++++ b/docs/AMD_ANTILAG_XESS_LATENCY_2026-11-19.md
+@@ -0,0 +1,123 @@
++# AMD Anti-Lag 2 and XeSS 30 → 120 latency work
++
++Status: **source implementation with CPU contract tests; no rebuilt Windows player.**
++
++The user runs XeSS 4X from a 30 FPS base and wants to reduce frame-generation
++delay. The original AMD portable ZIP was downloaded from the official v2.1.9
++release. Its SHA-256 matches the publisher's SHA256SUMS.txt:
++`f7113db09eff74065cfd9b7044df8db3c301ac5b7ff80f692da56fee2c2bf377`.
++The working source is tag v2.1.9, peeled commit
++`d442b4e5ac5907fffd4c20e9e876a324708750f2`.
++
++## XeSS-specific work
++
++XeSS already uses XeLL, which Intel requires with frame generation. The native
++AMD latency path is deliberately disabled for XeSS. We cannot correctly label
++the provider's hidden generated presents by tagging only Veyra's real presents,
++and a second source wait could conflict with XeLL. We preserve XeLL, its IDs and
++markers, the existing Intel scheduler, the tail-frame limiter and the existing
++2X path.
++
++An opt-in **XeSS lower-latency fallback** preference appears in the list and node
++editors when XeSS is selected. It applies only to live capture and only when the
++existing MFG pacing hook reaches its wall-clock fallback. It does not replace
++the primary Intel scheduler. When the normal scheduler handles a frame, this
++preference has no timing effect.
++
++In that fallback, the first generated frame occupies the current slot instead
++of waiting another output interval. Subsequent deadlines use the same absolute
++burst grid. The period comes from consecutive source PTS, when available, so
++the application's own waits are not learned as a slower input source. When a
++slot is already late it adds no catch-up delay. Unknown source timing retains
++the existing measured-period fallback. Native output frames are not discarded.
++
++For the isolated 30 FPS / 4X timing contract, generated deadlines change from
++approximately +8.33/+16.67/+25 ms to +0/+8.33/+16.67 ms when all three are paced
++by that fallback. If the provider owns the tail, its existing tail behavior
++still takes precedence. These are scheduled CPU deadlines, **not measured
++end-to-end latency improvements**. Earlier intermediate frames can make spacing
++less even relative to the provider-owned real/tail frames. The option defaults
++off and needs a hardware A/B test before recommending it.
++
++No change to A/B history, optical flow, image quality, export, source PTS,
++provider binaries on disk, or output FPS claims is part of this patch.
++
++## Native AMD Anti-Lag 2
++
++Added the official MIT-licensed DirectX 12 SDK header at fixed commit
++`390aa4a8c8655d0ae6e90079db2c85e103a96da3`, its license and provenance. The
++application initializes one context on the selected AMD D3D12 device, updates
++once before selecting the next accepted source, marks submitted source work,
++and identifies real/generated native presents separately. Waiting polls reuse
++the pending input. Driver errors or four excessive waits within sixteen input
++updates stop the session. Contexts are disabled/released at teardown and graph
++replacement. Reconfiguration permits an explicit retry.
++
++This opt-in path is limited to live capture with native Veyra-owned
++presentation. Radeon selection is UI eligibility; actual support is determined
++by SDK initialization on playback. No driver DLL is bundled or injected, no
++driver settings are changed, and the SDK's independent FPS cap stays disabled.
++File playback and still images do not invoke this input delay. The default is
++off. The two new preferences are separate from enhancement presets and retain
++old preference values and NVIDIA behavior.
++
++## Validation performed here
++
++- `python scripts/run-latency-contracts.py --output <private task directory>`:
++  24 AntiLagSession checks and 325 XeSS fallback cadence checks, all passed.
++- GCC C++20 builds use `-Wall -Wextra -Werror -pedantic`.
++- Lifecycle coverage includes unsupported initialization, waiting input,
++  3 generated + 1 real presents, cancellation, update/marker failures, release,
++  repeated enable/close and sustained stalls.
++- Timing coverage includes exact 30 → 120 slots, late readiness, pause/resume,
++  multiplier changes, invalid inputs and a ten-second source-grid simulation.
++- `python -B scripts/i18n/extract.py --check`: no missing English, Traditional
++  Chinese or Japanese translations; no placeholder errors. Four already-unused
++  startup-music entries from the release catalog are retained unchanged.
++- `git diff --check`: passed.
++
++New Qt Quick ownership/control tests are included, but were **not run**. Neither
++the native Windows driver adapter nor the modified player has been compiled in
++this environment. No Radeon, capture-card, display-scanout, physical latency,
++or visual smoothness results are claimed. CPU tests use a mocked driver API;
++they do not exercise AMD's driver. All portable binaries remain unmodified.
++
++## Windows build and validation handoff
++
++Apply the patch to the exact tag above, then use a separate Windows x64 build
++directory with MSVC 2022, C++20, Qt 6.8.3, the project's pinned XeSS SDK and the
++rest of its original SDK/dependency configuration. The portable ZIP contains
++runtime DLLs, not a complete compiler/SDK development environment. Preserve the
++patched FFmpeg dependencies and all original release features. See
++`docs/BUILD_2.1.9.md`, `docs/BUILD_2.1.9_2026-11-15.md` and `CMakeLists.txt` for the
++upstream dependency configuration; local E: paths in historical documents refer
++to the upstream developer's machine.
++
++From a configured Windows build:
++
++```powershell
++cmake --build <build-dir> --config Release --parallel 2 --target veyra_qml_ui veyra_anti_lag_tests veyra_xess_fallback_tests veyra_qml_quick_tests
++python scripts/run-latency-contracts.py --output <private-test-directory>
++```
++
++Use the upstream staging process to deploy the matching EXE, QML and embedded
++translation catalog together. Do not copy the new QML onto an original 2.1.9
++EXE: the original bridge has no corresponding new properties. Do not distribute
++or label a minimal build as the complete AMD portable release.
++
++On the user's Radeon hardware, compare baseline and candidate at 30 FPS input,
++XeSS 4X and 120 Hz output, using the same source, effects, resolution, VSync/VRR
++and driver settings. Turn the fallback preference off/on in the same candidate
++build; log `responsiveFallback`, `scheduled`, `bypassed` and `fallbackFrames`.
++If the fallback counter stays zero, this change cannot explain a difference.
++Measure source freshness and real displayed cadence, not merely four provider
++submissions. Check window/fullscreen, pause/resume, source gap, settings
++persistence, resize, seek and stop. Test native Anti-Lag separately with a
++Veyra-owned presentation backend; leave it out of XeSS latency comparisons.
++
++## Sources
++
++- https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.1.9
++- https://github.com/GPUOpen-LibrariesAndSDKs/AntiLag2-SDK
++- https://github.com/intel/xess/blob/main/doc/xell_developer_guide_english.md
++- https://github.com/intel/xess/blob/main/doc/xess_fg_developer_guide_english.md
+diff --git a/docs/WORKLOG.md b/docs/WORKLOG.md
+index 4ad7d24..264405c 100644
+--- a/docs/WORKLOG.md
++++ b/docs/WORKLOG.md
+@@ -1295,3 +1295,23 @@ ANR协作者于2026-11-13T15:49:32Z在Issue9明确禁止Beta第三方再分发
+ 用户确认测试正常并明确授权GitHub发布、全量更新公告、最新12群原图和1000字以内群公告。发行分支codex/release-2.1.9-20261115基于main ca614ef，远端main c327d45；已归档2.1.6两Release正文/标签/资产身份、本地最终交付。仅发行文档/README/二维码/包元数据，不重编译已验EXEc8a53dc7，产品b430d98生产源码不变。双语更新、条件/边界、对应源码/固定依赖文档齐全；原图复制12群，11月22日前、两QR各220、作者/英中教程保留且英文零起点；群公告669字符。
+ 
+ 脚本reports同任务init.py/docs.py/freeze.py及后续package/upload/verify，全部输出E盘同任务目录。先草稿上传与服务端SHA检查再公开/Latest，音乐不进源码，ANR禁止Beta再分发不扩大。远端验证及清理最终以FINAL.json/发行执行记录为准，不群发、不关机。
++
++
++## 2026-11-19 AMD Anti-Lag 2 / XeSS 30-to-120 latency source work
++
++User requested AMD Anti-Lag integration and latency optimization, then clarified
++XeSS 4X at 30 FPS input / 120 FPS output. Isolated local branch
++`feature/amd-anti-lag-2` starts at v2.1.9 (d442b4e). Downloaded the exact official
++AMD portable ZIP and matched published SHA-256. Added opt-in native AMD SDK
++lifecycle integration, with no second wait on XeSS; added opt-in live XeSS
++fallback scheduling using source-period deadlines and no first-slot extra wait.
++Defaults, XeLL, primary provider scheduling, tail limiter and portable binaries
++are preserved. Source changes and test boundary are detailed in
++`docs/AMD_ANTILAG_XESS_LATENCY_2026-11-19.md`.
++
++Linux GCC C++20 contracts: 24 Anti-Lag session and 325 fallback cadence checks,
++0 failures. i18n check has no missing translations/placeholder errors; existing
++unused startup-music catalog entries retained. Windows/MSVC/Qt player build,
++native AMD driver adapter compilation, Qt Quick execution and Radeon/physical
++latency validation NOT performed. No remote push, release or driver changes.
++The deliverable is a source patch, not a rebuilt portable application.
+diff --git a/i18n/catalog.json b/i18n/catalog.json
+index 3874b72..2a12753 100644
+--- a/i18n/catalog.json
++++ b/i18n/catalog.json
+@@ -20317,6 +20317,83 @@
+    "zh-TW": "每次啟動播放一次，動畫結束後繼續；此開關會儲存，角落按鈕僅停止本次",
+    "en": "Plays once per launch, continuing after the intro. This setting is saved; the corner button stops only this launch.",
+    "ja": "起動ごとに一度再生し、アニメ終了後も継続。この設定は保存され、隅のボタンは今回のみ停止します。"
++  },
++  {
++   "zh": "AMD Anti-Lag 2 · 已请求",
++   "src": "src/ui/bridge/Status.cpp",
++   "zh-TW": "AMD Anti-Lag 2 · 已請求",
++   "en": "AMD Anti-Lag 2 · requested",
++   "ja": "AMD Anti-Lag 2 · 要求済み"
++  },
++  {
++   "zh": "AMD Anti-Lag 2 · 当前未生效",
++   "src": "src/ui/bridge/Status.cpp",
++   "zh-TW": "AMD Anti-Lag 2 · 目前未生效",
++   "en": "AMD Anti-Lag 2 · currently inactive",
++   "ja": "AMD Anti-Lag 2 · 現在無効"
++  },
++  {
++   "zh": "AMD Anti-Lag 2 不可用，保留原队列策略",
++   "src": "src/engine/VideoPresenter.cpp",
++   "zh-TW": "AMD Anti-Lag 2 無法使用，保留原佇列策略",
++   "en": "AMD Anti-Lag 2 unavailable; keeping the existing queue policy",
++   "ja": "AMD Anti-Lag 2 は利用できません。既存のキューポリシーを維持します"
++  },
++  {
++   "zh": "AMD Anti-Lag 2 调用失败或等待过长，已关闭",
++   "src": "src/engine/EngineController.cpp",
++   "zh-TW": "AMD Anti-Lag 2 呼叫失敗或等待過久，已關閉",
++   "en": "AMD Anti-Lag 2 disabled after a driver error or excessive waits",
++   "ja": "ドライバーエラーまたは過剰な待機のため AMD Anti-Lag 2 を無効にしました"
++  },
++  {
++   "zh": "AMD Anti-Lag 2：已就绪",
++   "src": "src/engine/VideoPresenter.cpp",
++   "zh-TW": "AMD Anti-Lag 2：已就緒",
++   "en": "AMD Anti-Lag 2: initialized",
++   "ja": "AMD Anti-Lag 2：初期化済み"
++  },
++  {
++   "zh": "XeSS 低延迟回退",
++   "src": "qml/AmdLatencyEditor.qml",
++   "zh-TW": "XeSS 低延遲回退",
++   "en": "XeSS lower-latency fallback",
++   "ja": "XeSS 低遅延フォールバック"
++  },
++  {
++   "zh": "XeSS 低延迟回退 · 已请求",
++   "src": "src/ui/bridge/Status.cpp",
++   "zh-TW": "XeSS 低延遲回退 · 已請求",
++   "en": "XeSS lower-latency fallback · requested",
++   "ja": "XeSS 低遅延フォールバック · 要求済み"
++  },
++  {
++   "zh": "XeSS 低延迟回退：已请求，仅回退调度时生效",
++   "src": "src/engine/VideoPresenter.cpp",
++   "zh-TW": "XeSS 低延遲回退：已請求，僅回退排程時生效",
++   "en": "XeSS lower-latency fallback: requested; applies only during fallback scheduling",
++   "ja": "XeSS 低遅延フォールバック：要求済み。代替スケジューラー使用時のみ有効"
++  },
++  {
++   "zh": "XeSS 使用 XeLL，AMD Anti-Lag 2 未叠加",
++   "src": "src/engine/VideoPresenter.cpp",
++   "zh-TW": "XeSS 使用 XeLL，未疊加 AMD Anti-Lag 2",
++   "en": "XeSS uses XeLL; AMD Anti-Lag 2 is not stacked",
++   "ja": "XeSS は XeLL を使用します。AMD Anti-Lag 2 は併用しません"
++  },
++  {
++   "zh": "仅实时采集和原生呈现。XeSS 使用 XeLL，不叠加 AMD 等待。需要支持的 Radeon 显卡和驱动。",
++   "src": "qml/AmdLatencyEditor.qml",
++   "zh-TW": "僅即時擷取和原生呈現。XeSS 使用 XeLL，不疊加 AMD 等待。需要支援的 Radeon 顯示卡和驅動程式。",
++   "en": "Live capture with native presentation only. XeSS uses XeLL, without an additional AMD wait. Requires a supported Radeon GPU and driver.",
++   "ja": "ライブキャプチャとネイティブ表示専用です。XeSS は XeLL を使用し、AMD の待機を追加しません。対応する Radeon GPU とドライバーが必要です。"
++  },
++  {
++   "zh": "实验选项，仅实时采集。只减少备用调度器的等待，保留 XeLL 和 Intel 调度。可能降低均匀度，不保证降低总延迟。",
++   "src": "qml/AmdLatencyEditor.qml",
++   "zh-TW": "實驗選項，僅即時擷取。只減少備用排程器的等待，保留 XeLL 和 Intel 排程。可能降低均勻度，不保證降低總延遲。",
++   "en": "Experimental, live capture only. Reduces fallback-scheduler waits while preserving XeLL and Intel scheduling. May reduce pacing consistency; lower total latency is not guaranteed.",
++   "ja": "実験機能、ライブキャプチャ専用です。XeLL と Intel のスケジューリングを維持し、代替スケジューラーの待機だけを減らします。間隔が不均一になる可能性があり、総遅延の低減は保証されません。"
+   }
+  ]
+ }
+diff --git a/include/veyra/engine/PresentationSettings.h b/include/veyra/engine/PresentationSettings.h
+index d684893..c8488d2 100644
+--- a/include/veyra/engine/PresentationSettings.h
++++ b/include/veyra/engine/PresentationSettings.h
+@@ -29,6 +29,8 @@ struct PresentationSettings {
+     // explicit Vsync (G-SYNC/FreeSync + V-SYNC, see presentationVsync below).
+     bool variableRefresh=false;
+     NvidiaLowLatency nvidiaLowLatency=NvidiaLowLatency::Off;
++    bool amdAntiLag=false; // opt-in, native presentation only; XeSS owns XeLL
++    bool xessResponsiveFallback=false; // opt-in capture fallback pacing
+     bool operator==(const PresentationSettings&) const = default;
+     bool valid()const{return unsigned(mode)<=2&&unsigned(display)<=2&&unsigned(outputRate)<=2&&unsigned(nvidiaLowLatency)<=1&&std::isfinite(customFps)&&customFps>=1.0&&customFps<=1000.0;}
+ };
+diff --git a/include/veyra/engine/VideoPresenter.h b/include/veyra/engine/VideoPresenter.h
+index d54ab0f..94ea280 100644
+--- a/include/veyra/engine/VideoPresenter.h
++++ b/include/veyra/engine/VideoPresenter.h
+@@ -7,6 +7,7 @@
+ #include "veyra/engine/HdrOutputTuning.h"
+ #include "veyra/gfx/CommandSlotRing.h"
+ #include "veyra/gfx/ReflexSession.h"
++#include "veyra/gfx/AntiLagSession.h"
+ #include "veyra/gfx/NvidiaVrr.h"
+ #include "veyra/engine/PresentationSettings.h"
+ #include "veyra/engine/PresentCapture.h"
+@@ -46,13 +47,13 @@ public:
+     bool beginSourceInput(uint64_t stallUs=0);
+     bool beginSourceProcessing();
+     void sourceProcessed(pipeline::FrameIdentity);
+-    PresentationSettings configurePresentation(gfx::D3D12DeviceContext&,PresentationSettings,bool fg,std::wstring& status);
++    PresentationSettings configurePresentation(gfx::D3D12DeviceContext&,PresentationSettings,bool fg,std::wstring& status,bool liveSource=false);
+     bool presentationReady(){return sink_.presentationReady();}
+     gfx::PresentSink::RefreshGrid refreshGrid()const{return sink_.refreshGrid();}
+     bool waitPresentationReady(unsigned ms){return sink_.waitPresentationReady(ms);}
+     uint64_t beginReflex(){const auto id=reflexInputFrame_;reflexInputFrame_=0;reflex_.renderStart(id);return id;}
+     void endReflex(uint64_t id){reflex_.renderEnd(id);}
+-    void cancelReflexInput(){if(reflexInputFrame_)reflex_.mark(reflexInputFrame_,1);reflexInputFrame_=0;}
++    void cancelReflexInput(){antiLag_.cancelInput();if(reflexInputFrame_)reflex_.mark(reflexInputFrame_,1);reflexInputFrame_=0;}
+     void reflexFrame(uint64_t id){reflexFrame_=id;}
+     // True while XeSS owns Present: the low-latency queue and the output
+     // cap cannot reach provider-generated frames, so the UI greys them out.
+@@ -61,6 +62,8 @@ public:
+     // fence wait. XeSS shares the graph ring and must not re-enter it.
+     bool independentQueue()const{return presentationQueue_!=nullptr;}
+ 
++    bool antiLagFailed()const{return antiLag_.failed();}
++    int32_t antiLagResult()const{return antiLag_.lastResult();}
+     bool reflexActive()const{return reflex_.active();}
+     bool reflexDisablePending()const{return reflex_.disablePending();}
+     bool reflexFailed()const{return reflex_.failed();}
+@@ -126,6 +129,7 @@ private:
+     std::chrono::steady_clock::time_point metadataAttempt_{};
+     DXGI_HDR_METADATA_HDR10 lastMetadata_{};
+     gfx::ReflexSession reflex_;
++    gfx::AntiLagSession antiLag_{gfx::nativeAntiLagApi()};
+     uint64_t reflexFrame_=0,reflexInputFrame_=0,generation_=0;
+     int64_t lastPresentCallHost100ns_=0;
+     bool providerOwnedPresentation_=false;
+diff --git a/include/veyra/gfx/AntiLagSession.h b/include/veyra/gfx/AntiLagSession.h
+new file mode 100644
+index 0000000..b29edae
+--- /dev/null
++++ b/include/veyra/gfx/AntiLagSession.h
+@@ -0,0 +1,83 @@
++#pragma once
++#include <cstdint>
++#include <chrono>
++#include <bit>
++
++namespace veyra::gfx {
++// One session on the GPU owner thread. The opaque API keeps driver-independent
++// lifecycle tests runnable without a Windows graphics device.
++class AntiLagSession {
++public:
++    using Result = int32_t;
++    struct DriverApi {
++        Result (*create)(void* device, void** context) = nullptr;
++        Result (*update)(void* context, bool enabled) = nullptr;
++        Result (*endRendering)(void* context) = nullptr;
++        Result (*frameType)(void* context, bool generated) = nullptr;
++        void (*destroy)(void* context) = nullptr;
++    };
++    explicit AntiLagSession(DriverApi api):api_(api){}
++    ~AntiLagSession(){close();}
++    AntiLagSession(const AntiLagSession&) = delete;
++    AntiLagSession& operator=(const AntiLagSession&) = delete;
++
++    bool enable(void* device){
++        if(context_)return true;
++        if(failed_)return false;
++        if(!device||!api_.create||!api_.update||!api_.endRendering||!api_.frameType||!api_.destroy)
++            return fail(Result(0x80070057u));
++        const auto result=api_.create(device,&context_);
++        // AMD Initialize requires S_OK, not just a non-negative HRESULT.
++        if(result!=0||!context_)return fail(result?result:Result(0x80004002u));
++        return true;
++    }
++    void close(){
++        release();failed_=false;lastResult_=0;slowInputs_=0;
++    }
++    // Waiting/duplicate inputs keep their slot: one delay per accepted source,
++    // never one delay for every poll or generated output frame.
++    bool beginInput(uint64_t stallUs=0){
++        if(!context_||inputPending_)return !failed_;
++        const auto start=std::chrono::steady_clock::now();
++        const auto result=api_.update(context_,true);
++        if(result<0)return fail(result);
++        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
++        slowInputs_=uint16_t((slowInputs_<<1)|(stallUs&&uint64_t(elapsed)>stallUs));
++        // Source selection happens after this wait; sustained long waits on a
++        // video consumer can add latency rather than remove it. Fail closed.
++        if(std::popcount(slowInputs_)>=4)return fail(Result(0x800705b4u));
++        inputPending_=true;return true;
++    }
++    void submitted(){
++        if(!context_||!inputPending_)return;
++        inputPending_=false;
++        const auto result=api_.endRendering(context_);
++        if(result<0)fail(result);
++    }
++    void cancelInput(){inputPending_=false;}
++    void present(bool generated){
++        if(!context_)return;
++        const auto result=api_.frameType(context_,generated);
++        if(result<0)fail(result);
++    }
++    bool active()const{return context_!=nullptr;}
++    bool failed()const{return failed_;}
++    Result lastResult()const{return lastResult_;}
++private:
++    bool fail(Result result){lastResult_=result;failed_=true;release();return false;}
++    void release(){
++        inputPending_=false;
++        if(context_){
++            const auto result=api_.update(context_,false);
++            if(result<0){lastResult_=result;failed_=true;}
++            api_.destroy(context_);context_=nullptr;
++        }
++    }
++    DriverApi api_;
++    void* context_=nullptr;
++    bool inputPending_=false,failed_=false;
++    uint16_t slowInputs_=0;
++    Result lastResult_=0;
++};
++AntiLagSession::DriverApi nativeAntiLagApi();
++}
+diff --git a/include/veyra/gfx/XessFallbackCadence.h b/include/veyra/gfx/XessFallbackCadence.h
+new file mode 100644
+index 0000000..c4e180e
+--- /dev/null
++++ b/include/veyra/gfx/XessFallbackCadence.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++namespace veyra::gfx {
++// Opt-in fallback only: the Intel scheduler/tail limiter retain priority.
++// Integer tick arithmetic makes the 30 -> 120 schedule testable without a GPU.
++class XessFallbackCadence {
++    int64_t anchor_=0,period_=0;
++    uint64_t count_=0,lastIndex_=0;
++public:
++    void reset(){anchor_=period_=0;count_=lastIndex_=0;}
++    int64_t deadline(int64_t now,int64_t sourcePeriod,uint64_t index,uint64_t count){
++        if(now<=0||sourcePeriod<=0||index<1||index>count||count<2||count>5){reset();return now;}
++        // A late frame never pushes every remaining deadline forward. The
++        // first generated frame occupies the current slot; the other frames
++        // retain sourcePeriod/(count+1) spacing on the same absolute grid.
++        if(index==1||count!=count_||index<=lastIndex_||!anchor_){
++            anchor_=now;period_=sourcePeriod;count_=count;
++        }
++        lastIndex_=index;
++        const auto due=anchor_+(period_*int64_t(index-1))/int64_t(count+1);
++        // If readiness missed a slot, present immediately. Do not add a second
++        // source period to catch up, and do not invent new source timestamps.
++        return std::max(now,due);
++    }
++};
++}
+diff --git a/include/veyra/gfx/XessPacing.h b/include/veyra/gfx/XessPacing.h
+index 51265d4..a1c76ef 100644
+--- a/include/veyra/gfx/XessPacing.h
++++ b/include/veyra/gfx/XessPacing.h
+@@ -69,6 +69,9 @@ public:
+     // frame. Anything that does not match the audited provider refuses.
+     static State install(HMODULE provider, uint32_t generatedFrames);
+     static void release();
++    // Capture-only preference; never changes the provider scheduler or XeLL.
++    static void setResponsiveFallback(bool enabled);
++    static void setSourceInterval(double milliseconds);
+     static State snapshot();
+     static bool installed();
+     // Read-only identity check, mirroring XessMfgUnlock::providerIsAudited.
+diff --git a/include/veyra/ui/QmlPlayerBridge.h b/include/veyra/ui/QmlPlayerBridge.h
+index 984527f..6b854dc 100644
+--- a/include/veyra/ui/QmlPlayerBridge.h
++++ b/include/veyra/ui/QmlPlayerBridge.h
+@@ -77,6 +77,9 @@ class QmlPlayerBridge : public QObject {
+     Q_PROPERTY(QVariantList fgMultiplierChoices READ fgMultiplierChoices NOTIFY fgChoicesChanged)
+     Q_PROPERTY(bool fgStrict READ fgStrict WRITE setFgStrict NOTIFY settingsChanged)
+     Q_PROPERTY(bool fgLowQueue READ fgLowQueue WRITE setFgLowQueue NOTIFY settingsChanged)
++    Q_PROPERTY(bool amdAntiLag READ amdAntiLag WRITE setAmdAntiLag NOTIFY presentationChanged)
++    Q_PROPERTY(bool amdAntiLagAvailable READ amdAntiLagAvailable NOTIFY effectCapabilitiesChanged)
++    Q_PROPERTY(bool xessResponsiveFallback READ xessResponsiveFallback WRITE setXessResponsiveFallback NOTIFY presentationChanged)
+     Q_PROPERTY(int nvidiaLowLatency READ nvidiaLowLatency WRITE setNvidiaLowLatency NOTIFY presentationChanged)
+     Q_PROPERTY(bool nvidiaLowLatencyAvailable READ nvidiaLowLatencyAvailable NOTIFY effectCapabilitiesChanged)
+ 
+@@ -695,6 +698,11 @@ public:
+     bool fgStrict() const;
+     void setFgStrict(bool value);
+     bool fgLowQueue() const;
++    bool amdAntiLag() const;
++    void setAmdAntiLag(bool value);
++    bool amdAntiLagAvailable() const;
++    bool xessResponsiveFallback() const;
++    void setXessResponsiveFallback(bool value);
+     int nvidiaLowLatency() const;
+     void setNvidiaLowLatency(int value);
+     bool nvidiaLowLatencyAvailable() const;
+diff --git a/qml/Veyra/AmdLatencyEditor.qml b/qml/Veyra/AmdLatencyEditor.qml
+new file mode 100644
+index 0000000..2b3a2f5
+--- /dev/null
++++ b/qml/Veyra/AmdLatencyEditor.qml
+@@ -0,0 +1,32 @@
++import QtQuick
++import QtQuick.Layouts
++ColumnLayout {
++    id: root
++    property string namePrefix: "list"
++    property var backend: veyra
++    Layout.fillWidth: true
++    spacing: 4
++    VRow {
++        visible: root.backend.amdAntiLagAvailable === true
++        label: "AMD Anti-Lag 2"
++        hintBelow: true
++        hint: qsTr("仅实时采集和原生呈现。XeSS 使用 XeLL，不叠加 AMD 等待。需要支持的 Radeon 显卡和驱动。")
++        VSwitch {
++            objectName: root.namePrefix+"-amd-anti-lag"
++            enabled: root.backend.fgBackendName !== "xess" && !root.backend.presentationOwned
++            checked: root.backend.amdAntiLag
++            onToggled: checked => root.backend.amdAntiLag=checked
++        }
++    }
++    VRow {
++        visible: root.backend.fgBackendName === "xess"
++        label: qsTr("XeSS 低延迟回退")
++        hintBelow: true
++        hint: qsTr("实验选项，仅实时采集。只减少备用调度器的等待，保留 XeLL 和 Intel 调度。可能降低均匀度，不保证降低总延迟。")
++        VSwitch {
++            objectName: root.namePrefix+"-xess-responsive-fallback"
++            checked: root.backend.xessResponsiveFallback
++            onToggled: checked => root.backend.xessResponsiveFallback=checked
++        }
++    }
++}
+diff --git a/qml/Veyra/NodePage.qml b/qml/Veyra/NodePage.qml
+index 3527dd8..1f05525 100644
+--- a/qml/Veyra/NodePage.qml
++++ b/qml/Veyra/NodePage.qml
+@@ -1680,6 +1680,7 @@ VPage {
+                     VSwitch { checked: veyra.fgStrict; onToggled: checked => veyra.fgStrict = checked }
+                 }
+                 NvidiaLowLatencyEditor { namePrefix: "node" }
++                            AmdLatencyEditor { namePrefix: "node" }
+                 VRow {
+                     visible: !veyra.nvidiaLowLatencyAvailable
+                     label: qsTr("低延迟队列")
+diff --git a/qml/Veyra/ProPage.qml b/qml/Veyra/ProPage.qml
+index 1e93e2a..6ed5bf5 100644
+--- a/qml/Veyra/ProPage.qml
++++ b/qml/Veyra/ProPage.qml
+@@ -1867,6 +1867,7 @@ VPage {
+                                 DedupModeRow { backend: veyra; namePrefix: "list" }
+                             }
+                             NvidiaLowLatencyEditor { namePrefix: "list" }
++                            AmdLatencyEditor { namePrefix: "list" }
+                             VRow {
+                                 visible: !veyra.nvidiaLowLatencyAvailable
+                                 label: qsTr("低延迟队列")
+diff --git a/scripts/run-latency-contracts.py b/scripts/run-latency-contracts.py
+new file mode 100644
+index 0000000..ccc3f32
+--- /dev/null
++++ b/scripts/run-latency-contracts.py
+@@ -0,0 +1,49 @@
++"""Run driver-independent latency contracts; this does not build the player."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import subprocess
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output', type=Path, required=True)
++    parser.add_argument('--compiler', default='cl' if os.name == 'nt' else 'g++')
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parents[1]
++    output = args.output.resolve()
++    output.mkdir(parents=True, exist_ok=True)
++    results = []
++    for name, source in [('anti-lag', 'AntiLagSessionTests.cpp'),
++                         ('xess-fallback', 'XessFallbackCadenceTests.cpp')]:
++        executable = output / (name + ('.exe' if os.name == 'nt' else ''))
++        source_path = root / 'tests/unit' / source
++        if Path(args.compiler).stem.lower() == 'cl':
++            command = [args.compiler, '/nologo', '/std:c++20', '/EHsc', '/W4', '/WX',
++                       '/I' + str(root / 'include'), str(source_path), '/Fe:' + str(executable)]
++        else:
++            command = [args.compiler, '-std=c++20', '-Wall', '-Wextra', '-Werror',
++                       '-pedantic', '-pthread', '-I', str(root / 'include'),
++                       str(source_path), '-o', str(executable)]
++        built = subprocess.run(command, cwd=output, capture_output=True, text=True, timeout=120)
++        result = {'name': name, 'compile_command': command, 'compile_exit': built.returncode,
++                  'compile_output': built.stdout + built.stderr}
++        if built.returncode == 0:
++            ran = subprocess.run([str(executable)], cwd=output, capture_output=True,
++                                 text=True, timeout=30)
++            result.update(run_exit=ran.returncode, output=ran.stdout + ran.stderr,
++                          test_executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest())
++        results.append(result)
++    report = {'scope': 'driver-independent contracts only', 'tests': results,
++              'windows_player_built': False, 'qml_runtime_tested': False,
++              'radeon_driver_tested': False, 'physical_latency_measured': False}
++    (output / 'results.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
++    for result in results:
++        print(result.get('output', result['compile_output']), end='')
++    return 0 if all(r['compile_exit'] == 0 and r.get('run_exit') == 0 for r in results) else 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/src/engine/EngineController.cpp b/src/engine/EngineController.cpp
+index 549c2bc..3e5bda7 100644
+--- a/src/engine/EngineController.cpp
++++ b/src/engine/EngineController.cpp
+@@ -1423,6 +1423,12 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+                         std::lock_guard lock(mutex_);snapshot_.presentationEffective=presentationEffective;snapshot_.presentationStatus=presenter.reflexDisablePending()?L"英伟达低延迟调用及撤销失败；请关闭视频后重试":
+                             presenter.reflexStalled()?L"英伟达低延迟：驱动每帧等待过长，本次播放已关闭；当前使用低排队":L"英伟达低延迟调用失败，当前使用低排队；详见日志";
+                     }
++                    if(presentationEffective.amdAntiLag&&presenter.antiLagFailed()){
++                        presentationEffective.amdAntiLag=false;
++                        veyra::log::warn("amd-anti-lag",std::format("runtime disabled HRESULT=0x{:08X}",uint32_t(presenter.antiLagResult())));
++                        std::lock_guard lock(mutex_);snapshot_.presentationEffective=presentationEffective;
++                        snapshot_.presentationStatus=L"AMD Anti-Lag 2 调用失败或等待过长，已关闭";
++                    }
+                     if(presentationPaced&&!presenter.pacingActive()){
+                         // The sink already stopped waiting; reconfiguring would arm it again.
+                         presentationPaced=false;cadence.reset();
+@@ -1430,9 +1436,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+                     }
+                     return;
+                 }
+-                if(isImage){requested.enabled=false;requested.nvidiaLowLatency=NvidiaLowLatency::Off;}
++                if(isImage){requested.enabled=false;requested.nvidiaLowLatency=NvidiaLowLatency::Off;requested.amdAntiLag=false;requested.xessResponsiveFallback=false;}
+                 std::wstring message;
+-                presentationEffective=presenter.configurePresentation(ctx,requested,options.fg,message);
++                presentationEffective=presenter.configurePresentation(ctx,requested,options.fg,message,isCapture);
+                 presentationPaced=presenter.pacingActive()&&!legacyVsyncQueue;
+                 pacingRevision=revision;presenterGeneration=presenter.generation();pacingRefreshHz=refreshHz;cadence.reset();
+                 {std::lock_guard lock(mutex_);snapshot_.presentationEffective=presentationEffective;snapshot_.presentationRevision=revision;snapshot_.presentationStatus=message;snapshot_.presentationProviderOwned=presenter.providerOwnedPresentation();}
+diff --git a/src/engine/VideoPresenter.cpp b/src/engine/VideoPresenter.cpp
+index c596f29..b895839 100644
+--- a/src/engine/VideoPresenter.cpp
++++ b/src/engine/VideoPresenter.cpp
+@@ -3,11 +3,13 @@
+ #include "veyra/pipeline/EnhanceGraph.h"
+ #include "veyra/gfx/D3D12DeviceContext.h"
+ #include "veyra/gfx/CommandSlotRing.h"
++#include "veyra/gfx/XessPacing.h"
+ #include "veyra/sink/ImageExportSink.h"
+ #include <array>
+ #include <memory>
+ namespace veyra::engine {
+ bool VideoPresenter::beginSourceInput(uint64_t stallUs){
++    antiLag_.beginInput(stallUs); // failure falls back to the existing queue policy
+     if(!reflexInputFrame_&&reflex_.active())reflexInputFrame_=reflex_.begin(stallUs);
+     auto* xess=sink_.xess();if(!xess)return true;
+     // Waiting/filtered inputs keep the same preparation ID. Do not sleep again
+@@ -19,6 +21,7 @@ bool VideoPresenter::beginSourceProcessing(){
+     auto* xess=sink_.xess();return !xess||(beginSourceInput()&&xess->beginProcessing(xessInputId_));
+ }
+ void VideoPresenter::sourceProcessed(pipeline::FrameIdentity identity){
++    antiLag_.submitted();
+     if(!xessInputId_)return;
+     xessWork_[xessWorkPosition_]={identity,xessInputId_};
+     xessWorkPosition_=(xessWorkPosition_+1)%xessWork_.size();xessInputId_=0;
+@@ -133,6 +136,7 @@ bool VideoPresenter::prepareGraphChange(){
+     // Retain metadataSent_: a new graph disabling metadata must clear the
+     // hint that is still attached to the retained DXGI chain.
+     metadataDirty_=true;metadataAttempt_={};sourceMetadata_={};
++    antiLag_.close();
+     reflex_.close();reflexFrame_=reflexInputFrame_=0;
+     return true;
+ }
+@@ -501,6 +505,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     if(presentationQueue_)graph.presentationSubmitted(slot,fence,ring.lastSignaledValue());
+     const auto dxgiStart=std::chrono::steady_clock::now();
+     lastPresentCallHost100ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(dxgiStart.time_since_epoch()).count()/100;
++    antiLag_.present(generated);
+     reflex_.presentStart(reflexFrame,generated);
+     const bool presented=sink_.present(st);
+     reflex_.presentEnd(reflexFrame,generated);
+@@ -564,11 +569,13 @@ void VideoPresenter::publishLiveCoverage(const HdrCurveSettings& curve,pipeline:
+ }
+ 
+ void VideoPresenter::close(){
++    gfx::XessPacing::setResponsiveFallback(false);
+     metadataSent_=false;metadataDirty_=false;lastMetadata_={};sourceMetadata_={};metadataAttempt_={};
+     hdrPeakInfo_={};
+     refreshMonitor_=nullptr;refreshHz_=0;vrr_={};refreshQueried_=false;vrrSync_=false;displayStateSerial_=0;vrrConfirmAt_.reset();
+     retainedFrame_.reset();
+     xessInputId_=0;xessWork_={};xessWorkPosition_=0;
++    antiLag_.close();
+     reflex_.close();reflexFrame_=reflexInputFrame_=0;
+     if(presentationRing_.initialized())presentationRing_.drainQueue();
+     hasPresented_=false;gpuTimer_.close();compositeTarget_.Reset();exclusionUiTarget_.Reset();exclusionHudlessTarget_.Reset();exclusionUiEnabled_=false;copyBeforePresent_=copyEligible_=false;rtvs_.Reset();
+@@ -619,11 +626,17 @@ double VideoPresenter::displayRefreshHz(){
+     if(const auto state=displayStates_->state(monitor);state&&state->serial!=displayStateSerial_)applyDisplayState(*state);
+     return refreshHz_;
+ }
+-PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceContext& ctx,PresentationSettings requested,bool fg,std::wstring& status){
++PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceContext& ctx,PresentationSettings requested,bool fg,std::wstring& status,bool liveSource){
+     // The NVIDIA choice only runs on an NVIDIA adapter, where it implies the
+     // low queue. Another adapter keeps the plain switch's value; the UI retains
+     // the choice for the next NVIDIA session (syncNvidiaLowLatencyQueue).
+     const bool nvidia=ctx.adapter().isNvidia;
++    const bool amd=ctx.adapter().vendorId==0x1002;
++    const bool antiLagRequested=requested.amdAntiLag;
++    requested.amdAntiLag=requested.amdAntiLag&&amd&&liveSource;
++    if(requested.amdAntiLag)requested.enabled=true;
++    requested.xessResponsiveFallback=requested.xessResponsiveFallback&&liveSource&&xessActive();
++    gfx::XessPacing::setResponsiveFallback(requested.xessResponsiveFallback);
+     if(!nvidia)requested.nvidiaLowLatency=NvidiaLowLatency::Off;
+     else if(requested.nvidiaLowLatency!=NvidiaLowLatency::Off)requested.enabled=true;
+     bool wanted=requested.hdrFgCompatibility&&copyEligible_;
+@@ -648,6 +661,7 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
+             veyra::log::info("present-copy",std::format("requested={} eligible={} enabled={} (user preference; switch drains once)",requested.hdrFgCompatibility,copyEligible_,copyBeforePresent_));
+         }
+     }
++    antiLag_.close();
+     const bool reflexDisabled=reflex_.disable();reflexFrame_=reflexInputFrame_=0;
+     const bool followDisplay=requested.outputRate==OutputRateMode::FollowDisplay;
+     if(followDisplay){
+@@ -687,8 +701,11 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
+     };
+     const std::wstring syncMode=vrrSync_?L"显示同步：自动 + 可变刷新":requested.display==DisplaySync::Automatic?L"显示同步：自动":vsync?L"显示同步：垂直同步":L"显示同步：允许撕裂";
+     const std::wstring syncDetail=vrrSync_?(gfx::vrrLevel(vrr_)>=4?L"屏幕跟着画面刷新，不撕裂":L"已请求，等待驱动确认"):requested.display==DisplaySync::Automatic?L"不撕裂，也不等待垂直同步（延迟最低）":L"";
+-    if(!reflexDisabled){effective.enabled=false;effective.nvidiaLowLatency=NvidiaLowLatency::Off;sink_.configurePacing(false,vsync,tearing);status=join({L"英伟达低延迟撤销失败，请关闭视频后重试",syncMode,syncDetail});return effective;}
++    if(!reflexDisabled){effective.amdAntiLag=false;effective.enabled=false;effective.nvidiaLowLatency=NvidiaLowLatency::Off;sink_.configurePacing(false,vsync,tearing);status=join({L"英伟达低延迟撤销失败，请关闭视频后重试",syncMode,syncDetail});return effective;}
+     if(xessActive()){
++        // XeLL owns both source pacing and hidden generated presents. Do not
++        // stack Anti-Lag waits or mislabel all provider outputs as real frames.
++        effective.amdAntiLag=false;
+         // The provider owns Present for its generated frames, so neither the
+         // latency waiter nor an output cap can reach them. Only the DXGI VSync
+         // bit still applies (XeSS accepts it on the proxy chain).
+@@ -696,7 +713,9 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
+         effective.nvidiaLowLatency=NvidiaLowLatency::Off;
+         providerOwnedPresentation_=true;
+         sink_.configurePacing(false,vsync,tearing);
+-        status=join({L"XeSS 提供方自行调度：英伟达低延迟与输出上限不生效，选择已保留",syncMode,syncDetail});
++        status=join({L"XeSS 提供方自行调度：英伟达低延迟与输出上限不生效，选择已保留",
++            antiLagRequested?L"XeSS 使用 XeLL，AMD Anti-Lag 2 未叠加":L"",
++            effective.xessResponsiveFallback?L"XeSS 低延迟回退：已请求，仅回退调度时生效":L"",syncMode,syncDetail});
+         return effective;
+     }
+     providerOwnedPresentation_=false;
+@@ -726,6 +745,11 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
+             latency=L"英伟达低延迟：开（已启用）";
+         else{effective.nvidiaLowLatency=NvidiaLowLatency::Off;latency=L"英伟达低延迟不可用，当前使用低排队（详见日志）";}
+     }
++    if(requested.amdAntiLag){
++        if(antiLag_.enable(ctx.device()))latency=L"AMD Anti-Lag 2：已就绪";
++        else{effective.amdAntiLag=false;latency=L"AMD Anti-Lag 2 不可用，保留原队列策略";
++            veyra::log::warn("amd-anti-lag",std::format("initialize failed HRESULT=0x{:08X}",uint32_t(antiLag_.lastResult())));}
++    }
+     status=join({latency,cap,queue,syncMode,syncDetail});
+     return effective;
+ }
+diff --git a/src/gfx/AntiLagSession.cpp b/src/gfx/AntiLagSession.cpp
+new file mode 100644
+index 0000000..5c80a01
+--- /dev/null
++++ b/src/gfx/AntiLagSession.cpp
+@@ -0,0 +1,34 @@
++#include <windows.h>
++#include <d3d12.h>
++#include <new>
++#include "veyra/gfx/AntiLagSession.h"
++#include "../../third_party/amd-anti-lag-2/ffx_antilag2_dx12.h"
++
++namespace veyra::gfx {
++namespace {
++using Context=AMD::AntiLag2DX12::Context;
++AntiLagSession::Result create(void* device,void** opaque){
++    *opaque=nullptr;
++    auto* context=new(std::nothrow) Context{};
++    if(!context)return E_OUTOFMEMORY;
++    const auto result=AMD::AntiLag2DX12::Initialize(context,static_cast<ID3D12Device*>(device));
++    if(result!=S_OK){AMD::AntiLag2DX12::DeInitialize(context);delete context;return result;}
++    *opaque=context;return S_OK;
++}
++AntiLagSession::Result update(void* context,bool enabled){
++    // Veyra's existing output cap remains the only frame-rate limiter.
++    return AMD::AntiLag2DX12::Update(static_cast<Context*>(context),enabled,0);
++}
++AntiLagSession::Result endRendering(void* context){
++    return AMD::AntiLag2DX12::MarkEndOfFrameRendering(static_cast<Context*>(context));
++}
++AntiLagSession::Result frameType(void* context,bool generated){
++    return AMD::AntiLag2DX12::SetFrameGenFrameType(static_cast<Context*>(context),generated);
++}
++void destroy(void* context){
++    auto* native=static_cast<Context*>(context);
++    AMD::AntiLag2DX12::DeInitialize(native);delete native;
++}
++}
++AntiLagSession::DriverApi nativeAntiLagApi(){return {create,update,endRendering,frameType,destroy};}
++}
+diff --git a/src/gfx/XessPacing.cpp b/src/gfx/XessPacing.cpp
+index e81ff4a..539ca6d 100644
+--- a/src/gfx/XessPacing.cpp
++++ b/src/gfx/XessPacing.cpp
+@@ -1,4 +1,6 @@
+ #include "veyra/gfx/XessPacing.h"
++#include "veyra/gfx/XessFallbackCadence.h"
++#include <atomic>
+ 
+ #include "veyra/Log.h"
+ #include "veyra/ThunkHook.h"
+@@ -93,6 +95,9 @@ struct PacingState {
+     size_t periodCount=0,periodPosition=0;
+     int64_t lastBurstQpc=0,periodQpc=0,intervalQpc=0,targetQpc=0;
+     uint64_t fallbackFrames=0;
++    std::atomic<bool> responsiveFallback{false};
++    std::atomic<double> sourceIntervalMs{0};
++    XessFallbackCadence responsiveCadence;
+ };
+ 
+ PacingState& state() {
+@@ -174,10 +179,18 @@ void paceFallback(void* ctx,uint8_t* burst,uint64_t index,uint64_t count,bool is
+     if(isLast&&count>2&&reinterpret_cast<uint8_t*>(ctx)[XessPacing::kSchedLimiterOffset]!=0&&
+        *reinterpret_cast<uint32_t*>(burst+0x28)==0)return;
+     auto& s=state();LARGE_INTEGER now{};QueryPerformanceCounter(&now);
+-    if(s.intervalQpc<=0)return;
+-    if(index<=1)s.targetQpc=now.QuadPart+s.intervalQpc;
+-    else s.targetQpc+=s.intervalQpc;
+-    s.targetQpc=(std::min)(s.targetQpc,now.QuadPart+s.periodQpc);
++    if(s.responsiveFallback.load(std::memory_order_relaxed)){
++        const auto sourceMs=s.sourceIntervalMs.load(std::memory_order_relaxed);
++        const auto period=sourceMs>0?int64_t(sourceMs*double(s.frequency.QuadPart)/1000.0):s.periodQpc;
++        if(period<=0)return;
++        s.targetQpc=s.responsiveCadence.deadline(now.QuadPart,period,index,count);
++    }else{
++        s.responsiveCadence.reset();
++        if(s.intervalQpc<=0)return;
++        if(index<=1)s.targetQpc=now.QuadPart+s.intervalQpc;
++        else s.targetQpc+=s.intervalQpc;
++        s.targetQpc=(std::min)(s.targetQpc,now.QuadPart+s.periodQpc);
++    }
+     const auto yieldBelow=s.frequency.QuadPart/5000;
+     while(now.QuadPart<s.targetQpc){
+         if(s.targetQpc-now.QuadPart>yieldBelow)Sleep(0);else YieldProcessor();
+@@ -388,6 +401,7 @@ XessPacing::State XessPacing::install(HMODULE provider, uint32_t generatedFrames
+     s.firstOutputQpc=0;s.startupOutputs={};s.steadyOutputs={};
+     s.periods={};s.periodCount=s.periodPosition=0;
+     s.lastBurstQpc=s.periodQpc=s.intervalQpc=s.targetQpc=0;s.fallbackFrames=0;
++    s.sourceIntervalMs.store(0,std::memory_order_relaxed);s.responsiveCadence.reset();
+     s.gapSum = s.gapSamples = 0;
+     s.gapMin = s.gapMax = 0;
+     s.lastMultiplier = 0;
+@@ -419,6 +433,15 @@ XessPacing::State XessPacing::install(HMODULE provider, uint32_t generatedFrames
+     return result;
+ }
+ 
++void XessPacing::setResponsiveFallback(bool enabled){
++    const bool previous=state().responsiveFallback.exchange(enabled,std::memory_order_relaxed);
++    if(previous!=enabled)log::info("xess-pacing",std::format("responsiveFallback={} (fallback only; Intel scheduler and tail limiter unchanged)",enabled));
++}
++
++void XessPacing::setSourceInterval(double milliseconds){
++    state().sourceIntervalMs.store(std::isfinite(milliseconds)&&milliseconds>=0.125&&milliseconds<500?milliseconds:0,std::memory_order_relaxed);
++}
++
+ void XessPacing::release() {
+     auto& s = state();
+     std::lock_guard lock(s.mutex);
+@@ -437,6 +460,8 @@ void XessPacing::release() {
+     }
+     log::info("xess-pacing", std::format("removed (scheduled={} refused={} bypassed={} forwarded={} fallbackFrames={})",
+                                          s.scheduled, s.refused, s.bypassed, s.forwarded,s.fallbackFrames));
++    s.responsiveFallback.store(false,std::memory_order_relaxed);
++    s.sourceIntervalMs.store(0,std::memory_order_relaxed);s.responsiveCadence.reset();
+ }
+ 
+ XessPacing::State XessPacing::snapshot() {
+diff --git a/src/gfx/XessPresenter.cpp b/src/gfx/XessPresenter.cpp
+index 5f9901f..dbe73d5 100644
+--- a/src/gfx/XessPresenter.cpp
++++ b/src/gfx/XessPresenter.cpp
+@@ -283,6 +283,9 @@ bool XessPresenter::tag(ID3D12GraphicsCommandList* list,ID3D12Resource* color,ID
+        !(ui?resource(XEFG_SWAPCHAIN_RES_UI,ui,true):resource(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,color,true))||
+        (ui&&hudless&&!resource(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,hudless,true))||
+        !resource(XEFG_SWAPCHAIN_RES_MOTION_VECTOR,motion,false)||!resource(XEFG_SWAPCHAIN_RES_DEPTH,depth,false))return false;
++    // The optional fallback must use the same source-clock period as XeFG,
++    // rather than learning its own inserted waits as a slower input cadence.
++    XessPacing::setSourceInterval(reset?0:elapsedMs);
+     xefg_swapchain_frame_constant_data_t constants{};
+     for(unsigned i=0;i<4;++i){constants.viewMatrix[i*5]=1;constants.projectionMatrix[i*5]=1;}
+     constants.motionVectorScaleX=constants.motionVectorScaleY=1;
+diff --git a/src/ui/QmlPlayerBridge.cpp b/src/ui/QmlPlayerBridge.cpp
+index e9a1b45..259d216 100644
+--- a/src/ui/QmlPlayerBridge.cpp
++++ b/src/ui/QmlPlayerBridge.cpp
+@@ -328,6 +328,8 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
+         pr.hdrFgCompatibility = impl_->prefBool("hdrFgCompatibility", false);
+         if (!saved.isEmpty()) {
+             pr.enabled = saved.value(QStringLiteral("lowQueue")).toBool();
++            pr.amdAntiLag = saved.value(QStringLiteral("amdAntiLag"),false).toBool();
++            pr.xessResponsiveFallback = saved.value(QStringLiteral("xessResponsiveFallback"),false).toBool();
+             // Before NVIDIA-specific choices, the low queue meant On on NVIDIA.
+             const int savedLatency=saved.value(QStringLiteral("nvidiaLowLatency"),pr.enabled&&nvidiaLowLatencyAvailable()?1:0).toInt();
+             pr.nvidiaLowLatency=engine::savedNvidiaLowLatency(savedLatency);
+diff --git a/src/ui/bridge/FrameGeneration.cpp b/src/ui/bridge/FrameGeneration.cpp
+index 15ed6d0..28b9ca0 100644
+--- a/src/ui/bridge/FrameGeneration.cpp
++++ b/src/ui/bridge/FrameGeneration.cpp
+@@ -177,6 +177,17 @@ void QmlPlayerBridge::setFgLowQueue(bool value) {
+     if(nvidiaLowLatencyAvailable())impl_->presentation.nvidiaLowLatency=value?engine::NvidiaLowLatency::On:engine::NvidiaLowLatency::Off;
+     applyPresentation();
+ }
++bool QmlPlayerBridge::amdAntiLag()const{return impl_->presentation.amdAntiLag;}
++bool QmlPlayerBridge::amdAntiLagAvailable()const{return primaryGpuVendor()==0x1002;}
++void QmlPlayerBridge::setAmdAntiLag(bool value){
++    if(impl_->presentation.amdAntiLag==value||(!amdAntiLagAvailable()&&value))return;
++    impl_->presentation.amdAntiLag=value;applyPresentation();
++}
++bool QmlPlayerBridge::xessResponsiveFallback()const{return impl_->presentation.xessResponsiveFallback;}
++void QmlPlayerBridge::setXessResponsiveFallback(bool value){
++    if(impl_->presentation.xessResponsiveFallback==value)return;
++    impl_->presentation.xessResponsiveFallback=value;applyPresentation();
++}
+ int QmlPlayerBridge::nvidiaLowLatency()const{return int(impl_->presentation.nvidiaLowLatency);}
+ bool QmlPlayerBridge::nvidiaLowLatencyAvailable()const{return primaryGpuVendor()==0x10de;}
+ void QmlPlayerBridge::setNvidiaLowLatency(int value){
+@@ -370,7 +381,7 @@ void QmlPlayerBridge::applyPresentation() {
+     if (!p.valid()) return;
+     impl_->engine.requestPresentation(p);
+     impl_->prefs[QStringLiteral("presentation")] = QVariantMap{
+-        {"lowQueue", p.enabled}, {"nvidiaLowLatency",int(p.nvidiaLowLatency)}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}, {"vrr", p.variableRefresh}};
++        {"lowQueue", p.enabled}, {"amdAntiLag",p.amdAntiLag}, {"xessResponsiveFallback",p.xessResponsiveFallback}, {"nvidiaLowLatency",int(p.nvidiaLowLatency)}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}, {"vrr", p.variableRefresh}};
+     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "presentation settings not saved");
+     veyra::log::info("ui-presentation", std::format("lowQueue={} nvidiaLowLatency={} display={} outputRate={} customFps={:.3f} variableRefresh={}",
+         p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
+diff --git a/src/ui/bridge/Status.cpp b/src/ui/bridge/Status.cpp
+index fa87a6c..5c5461a 100644
+--- a/src/ui/bridge/Status.cpp
++++ b/src/ui/bridge/Status.cpp
+@@ -417,7 +417,11 @@ void QmlPlayerBridge::updateRunStatus() {
+         if(s.running&&s.presentationEffective.nvidiaLowLatency==engine::NvidiaLowLatency::Off)options<<tr("英伟达低延迟 · 当前未生效");
+         else options<<tr("英伟达低延迟 · 开");
+     }
++    else if(amdAntiLagAvailable()&&i.presentation.amdAntiLag){
++        options<<(s.running&&!s.presentationEffective.amdAntiLag?tr("AMD Anti-Lag 2 · 当前未生效"):tr("AMD Anti-Lag 2 · 已请求"));
++    }
+     else if(i.presentation.enabled)options<<(s.running&&!s.presentationEffective.enabled?tr("低延迟队列 · 当前未生效"):tr("低延迟队列"));
++    if(i.presentation.xessResponsiveFallback)options<<tr("XeSS 低延迟回退 · 已请求");
+     if(!s.capture&&std::abs(s.playbackRate-1.0)>.001)options<<tr("播放速度 %1×").arg(s.playbackRate,0,'f',2);
+     if(i.compareMode!=0)options<<tr("画面对比 · 补帧暂停");
+     QStringList detail;
+diff --git a/tests/qml/QuickSmokeTests.cpp b/tests/qml/QuickSmokeTests.cpp
+index c4bca16..7efbbc1 100644
+--- a/tests/qml/QuickSmokeTests.cpp
++++ b/tests/qml/QuickSmokeTests.cpp
+@@ -65,6 +65,11 @@ QtObject {
+     // Off by default, as before these existed: only the low latency test turns them on.
+     property bool nvidiaLowLatencyAvailable: false
+     property int nvidiaLowLatency: 0
++    property bool amdAntiLagAvailable: false
++    property bool amdAntiLag: false
++    property bool xessResponsiveFallback: false
++    property bool presentationOwned: false
++    property string fgBackendName: "fsr3"
+     property bool running: false
+     property string presentationStatus: ""
+     signal settingsChanged()
+@@ -98,6 +103,8 @@ QtObject {
+             QStringLiteral("qml/Veyra/ExportPage.qml"))), "VeyraTest", 1, 0, "ExportPage");
+         qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
+             QStringLiteral("qml/Veyra/NvidiaLowLatencyEditor.qml"))), "VeyraTest", 1, 0, "NvidiaLowLatencyEditor");
++        qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
++            QStringLiteral("qml/Veyra/AmdLatencyEditor.qml"))), "VeyraTest", 1, 0, "AmdLatencyEditor");
+     }
+ };
+ 
+diff --git a/tests/qml/quick/tst_amd_latency.qml b/tests/qml/quick/tst_amd_latency.qml
+new file mode 100644
+index 0000000..47d0a21
+--- /dev/null
++++ b/tests/qml/quick/tst_amd_latency.qml
+@@ -0,0 +1,51 @@
++import QtQuick
++import QtQuick.Layouts
++import QtTest
++import Veyra
++import VeyraTest 1.0
++Item {
++    width: 800; height: 500
++    QtObject {
++        id: bridge
++        property bool amdAntiLagAvailable: true
++        property bool amdAntiLag: false
++        property bool xessResponsiveFallback: false
++        property bool presentationOwned: false
++        property string fgBackendName: "fsr3"
++    }
++    ColumnLayout {
++        width: parent.width
++        AmdLatencyEditor { id: list; backend: bridge; namePrefix: "test-list" }
++        AmdLatencyEditor { id: node; backend: bridge; namePrefix: "test-node" }
++    }
++    TestCase {
++        name: "AmdLatencyOwnership"
++        when: windowShown
++        function init(){
++            bridge.amdAntiLagAvailable=true;bridge.amdAntiLag=false
++            bridge.xessResponsiveFallback=false;bridge.presentationOwned=false
++            bridge.fgBackendName="fsr3";wait(20)
++        }
++        function anti(editor){return findChild(editor,editor.namePrefix+"-amd-anti-lag")}
++        function fallback(editor){return findChild(editor,editor.namePrefix+"-xess-responsive-fallback")}
++        function test_defaults_and_shared_preference(){
++            compare(bridge.amdAntiLag,false);compare(bridge.xessResponsiveFallback,false)
++            mouseClick(anti(list))
++            compare(bridge.amdAntiLag,true);compare(anti(node).checked,true)
++            mouseClick(anti(node))
++            compare(bridge.amdAntiLag,false);compare(anti(list).checked,false)
++        }
++        function test_xess_never_offers_stacked_anti_lag(){
++            bridge.amdAntiLag=true;bridge.fgBackendName="xess";wait(20)
++            compare(anti(list).enabled,false);compare(anti(node).enabled,false)
++            compare(bridge.amdAntiLag,true,"retained choice is not silently rewritten")
++            verify(fallback(list).visible)
++            mouseClick(fallback(list))
++            compare(bridge.xessResponsiveFallback,true);compare(fallback(node).checked,true)
++        }
++        function test_provider_owned_disables_native_control(){
++            bridge.presentationOwned=true;wait(20)
++            compare(anti(list).enabled,false)
++        }
++    }
++}
+diff --git a/tests/unit/AntiLagSessionTests.cpp b/tests/unit/AntiLagSessionTests.cpp
+new file mode 100644
+index 0000000..4e67d66
+--- /dev/null
++++ b/tests/unit/AntiLagSessionTests.cpp
+@@ -0,0 +1,62 @@
++#include "veyra/gfx/AntiLagSession.h"
++#include "veyra/engine/PresentationSettings.h"
++#include <cstdio>
++#include <string>
++#include <thread>
++namespace {
++using Session=veyra::gfx::AntiLagSession;
++std::string calls;
++int creates=0,destroys=0;
++int32_t createResult=0,updateResult=0,endResult=0,typeResult=0;
++bool slow=false;
++int32_t create(void*,void** context){++creates;calls+='C';*context=createResult==0?&creates:nullptr;return createResult;}
++int32_t update(void*,bool on){calls+=on?'U':'D';if(on&&slow)std::this_thread::sleep_for(std::chrono::milliseconds(2));return on?updateResult:0;}
++int32_t end(void*){calls+='E';return endResult;}
++int32_t type(void*,bool generated){calls+=generated?'G':'R';return typeResult;}
++void destroy(void*){calls+='X';++destroys;}
++Session::DriverApi api(){return {create,update,end,type,destroy};}
++void reset(){calls.clear();creates=destroys=0;createResult=updateResult=endResult=typeResult=0;slow=false;}
++}
++int main(){
++    int failed=0,checks=0;
++    auto check=[&](bool ok,const char* name){++checks;if(!ok){++failed;std::printf("FAIL %s\n",name);}};
++    void* device=&failed;
++    reset();{
++        Session s(api());check(s.enable(device),"initialize");check(s.enable(device)&&creates==1,"enable is idempotent");
++        check(s.beginInput()&&s.beginInput()&&calls=="CU","waiting input delays only once");
++        s.submitted();s.submitted();s.present(true);s.present(true);s.present(true);s.present(false);
++        check(calls=="CUEGGGR","30 to 120: one input and end marker, three generated and one real output");
++        s.beginInput();s.cancelInput();s.beginInput();s.submitted();
++        check(calls.ends_with("UUE"),"cancelled input can start a new cycle");
++        s.close();s.close();check(destroys==1&&calls.ends_with("DX"),"disable and release once");
++    }
++    reset();{
++        createResult=-1;Session s(api());check(!s.enable(device)&&s.failed(),"unsupported driver fails closed");
++        s.beginInput();s.present(false);check(calls=="C"&&!s.active(),"unsupported driver receives no frame calls");
++        check(!s.enable(device)&&creates==1,"failure is latched until explicit reconfigure");
++        s.close();createResult=0;check(s.enable(device),"explicit retry after close");
++    }
++    reset();{
++        createResult=1;Session s(api());check(!s.enable(device)&&!s.active(),"S_FALSE is not initialization success");
++    }
++    for(int failure=0;failure<3;++failure){reset();{
++        Session s(api());s.enable(device);
++        if(failure==0)updateResult=-10;
++        if(failure==1)endResult=-11;
++        if(failure==2)typeResult=-12;
++        s.beginInput();s.submitted();s.present(true);
++        check(s.failed()&&!s.active()&&destroys==1,"frame failure disables and releases");
++        const auto before=calls;s.beginInput();s.submitted();s.present(false);check(calls==before,"no driver calls after failure");
++    }check(destroys==1,"failure plus destructor does not double release");}
++    reset();{
++        Session s(api());s.enable(device);slow=true;
++        for(int i=0;i<4;++i){s.beginInput(100);s.submitted();}
++        check(s.failed()&&!s.active(),"sustained long waits disable the latency consumer");
++    }
++    reset();{Session s(api());check(!s.enable(nullptr)&&creates==0,"no null device initialization");}
++    veyra::engine::PresentationSettings p;
++    check(!p.amdAntiLag&&!p.xessResponsiveFallback&&p.valid(),"new settings default off");
++    auto requested=p;requested.amdAntiLag=true;requested.xessResponsiveFallback=true;
++    check(requested.valid()&&requested!=p,"opt-ins participate in settings equality");
++    std::printf("AntiLagSession: %d checks, %d failures\n",checks,failed);return failed?1:0;
++}
+diff --git a/tests/unit/XessFallbackCadenceTests.cpp b/tests/unit/XessFallbackCadenceTests.cpp
+new file mode 100644
+index 0000000..17a37bd
+--- /dev/null
++++ b/tests/unit/XessFallbackCadenceTests.cpp
+@@ -0,0 +1,35 @@
++#include "veyra/gfx/XessFallbackCadence.h"
++#include <cstdio>
++int main(){
++    using veyra::gfx::XessFallbackCadence;
++    int failed=0,checks=0;
++    auto check=[&](bool ok,const char* name){++checks;if(!ok){++failed;std::printf("FAIL %s\n",name);}};
++    // 120000 ticks/s: exact 30 Hz input, 120 Hz output, no rounding ambiguity.
++    XessFallbackCadence p;
++    check(p.deadline(10000,4000,1,3)==10000,"30 -> 120: no extra first-slot wait");
++    check(p.deadline(10000,4000,2,3)==11000,"second generated slot is 8.333 ms later");
++    check(p.deadline(11000,4000,3,3)==12000,"third generated slot stays on source-clock grid");
++    check(p.deadline(14000,4000,1,3)==14000,"next burst reanchors to actual readiness");
++    check(p.deadline(18000,4000,2,3)==18000,"GPU stall never queues an expired deadline");
++    check(p.deadline(18000,4000,3,3)==18000,"late second frame does not shift the remaining grid");
++    check(p.deadline(1000000,4000,1,3)==1000000,"pause/resume carries no old deadline debt");
++    check(p.deadline(1000000,4000,2,3)==1001000,"pause duration does not become source period");
++    p.reset();
++    for(unsigned generated=2;generated<=5;++generated){
++        int64_t last=0;
++        for(unsigned index=1;index<=generated;++index){
++            auto due=p.deadline(10000,6000,index,generated);
++            check(due>=last&&due<16000,"all multipliers stay ordered within one source period");last=due;
++        }
++    }
++    check(p.deadline(10000,0,1,3)==10000,"unknown period adds no delay");
++    check(p.deadline(10000,4000,0,3)==10000,"invalid frame index adds no delay");
++    check(p.deadline(10000,4000,1,1)==10000,"stock 2X is outside fallback scope");
++    // Simulated producer arrives every 4000 ticks for 10 seconds. A previous
++    // paced output cannot feed back and slow the source's 30 Hz clock.
++    for(int64_t start=10000;start<1210000;start+=4000){
++        const auto a=p.deadline(start,4000,1,3),b=p.deadline(start,4000,2,3),c=p.deadline(start,4000,3,3);
++        check(a==start&&b==start+1000&&c==start+2000,"10 second 30 -> 120 source-grid simulation");
++    }
++    std::printf("XeSS fallback cadence: %d checks, %d failures\n",checks,failed);return failed?1:0;
++}
+diff --git a/third_party/amd-anti-lag-2/LICENSE.txt b/third_party/amd-anti-lag-2/LICENSE.txt
+new file mode 100644
+index 0000000..2559e2a
+--- /dev/null
++++ b/third_party/amd-anti-lag-2/LICENSE.txt
+@@ -0,0 +1,23 @@
++This file is part of the Anti-Lag 2 SDK.
++
++Copyright (C) 2024 Advanced Micro Devices, Inc.
++
++SPDX License Identifier: MIT
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
+diff --git a/third_party/amd-anti-lag-2/UPSTREAM.json b/third_party/amd-anti-lag-2/UPSTREAM.json
+new file mode 100644
+index 0000000..cc9a361
+--- /dev/null
++++ b/third_party/amd-anti-lag-2/UPSTREAM.json
+@@ -0,0 +1,10 @@
++{
++  "repository": "https://github.com/GPUOpen-LibrariesAndSDKs/AntiLag2-SDK",
++  "commit": "390aa4a8c8655d0ae6e90079db2c85e103a96da3",
++  "license": "MIT",
++  "files": [
++    "ffx_antilag2_dx12.h",
++    "LICENSE.txt"
++  ],
++  "modifications": "None"
++}
+diff --git a/third_party/amd-anti-lag-2/ffx_antilag2_dx12.h b/third_party/amd-anti-lag-2/ffx_antilag2_dx12.h
+new file mode 100644
+index 0000000..446b5fc
+--- /dev/null
++++ b/third_party/amd-anti-lag-2/ffx_antilag2_dx12.h
+@@ -0,0 +1,249 @@
++// This file is part of the Anti-Lag 2.0 SDK.
++//
++// Copyright (c) 2024 Advanced Micro Devices, Inc. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++#pragma once
++
++namespace AMD {
++namespace AntiLag2DX12 {
++
++    struct Context;
++
++    // Initialize function - call this once before the Update function.
++    // context - Declare a persistent Context variable in your game code. Ensure the contents are zero'ed, and pass the address in to initialize it.
++    //           Be sure to use the *same* context object everywhere when calling the Anti-Lag 2.0 SDK functions.
++    // device - The game's D3D12 device.
++    // A return value of S_OK indicates that Anti-Lag 2.0 is available on the system.
++    HRESULT Initialize( Context* context, ID3D12Device* device );
++
++    // DeInitialize function - call this before destroying the device.
++    // context - address of the game's context object.
++    // The return value is the reference count of the internal API. It should be 0.
++    ULONG DeInitialize( Context* context );
++
++    // Update function - call this just before the input to the game is polled.
++    // context - address of the game's context object.
++    // enable - enables or disables Anti-Lag 2.0.
++    // maxFPS - sets a framerate limit. Zero will disable the limiter.
++    HRESULT Update( Context* context, bool enable, unsigned int maxFPS );
++
++    // Call this on the game render thread once the game's main rendering workload has been submitted in an ExecuteCommandLists call.
++    // Call before the FSR 3 Present call is made.
++    // This is only required if frame generation is enabled, but calling it anyway is harmless.
++    // context - address of the game's context object.
++    HRESULT MarkEndOfFrameRendering( Context* context );
++
++    // Call this on the presentation thread just before the Present call.
++    // This is only required if frame generation is enabled, but calling it anyway is harmless.
++    // context - address of the game's context object.
++    // bInterpolatedFrame - whether the frame about to be presented is interpolated.
++    HRESULT SetFrameGenFrameType( Context* context, bool bInterpolatedFrame );
++
++    //
++    // End of public API section.
++    // Private implementation details below.
++    //
++
++    // Forward declaration of the Anti-Lag interface into the DX12 driver
++    MIDL_INTERFACE("44085fbe-e839-40c5-bf38-0ebc5ab4d0a6")
++    IAmdExtAntiLagApi: public IUnknown
++    {
++    public:
++        virtual HRESULT UpdateAntiLagState(VOID* pData) = 0;
++    };
++
++    // Context structure for the SDK. Declare a persistent object of this type *once* in your game code.
++    // Ensure the contents are initialized to zero before calling Initialize() but do not modify these members directly after that.
++    struct Context
++    {
++        IAmdExtAntiLagApi*  m_pAntiLagAPI = nullptr;
++        bool                m_enabled = false;
++        unsigned int        m_maxFPS = 0;
++    };
++
++    // Structure version 1 for Anti-Lag 2.0:
++    struct APIData_v1
++    {
++        unsigned int    uiSize;
++        unsigned int    uiVersion;
++        unsigned int    eMode;
++        const char*     sControlStr;
++        unsigned int    uiControlStrLength;
++        unsigned int    maxFPS;
++    };
++    static_assert(sizeof(APIData_v1) == 32, "Check structure packing compiler settings.");
++
++    // Structure version 2 for Anti-Lag 2.0:
++    struct APIData_v2
++    {
++        unsigned int    uiSize;
++        unsigned int    uiVersion;
++        struct Flags
++        {
++            unsigned int unused0               : 1;
++            unsigned int unused1               : 1;
++
++            unsigned int signalFgFrameType     : 1;
++            unsigned int isInterpolatedFrame   : 1;
++
++            unsigned int signalGetUserInputIdx : 1;
++            unsigned int signalEndOfFrameIdx   : 1;
++
++            unsigned int reserved              :26;
++        }               flags;
++        unsigned __int64    iiFrameIdx;
++        unsigned __int64    uiiReserved[19];
++    };
++    static_assert(sizeof(APIData_v2) == 176, "Check structure packing compiler settings.");
++
++    inline HRESULT Initialize( Context* context, ID3D12Device* device )
++    {
++        HRESULT hr = E_INVALIDARG;
++        if ( context && device && context->m_pAntiLagAPI == nullptr )
++        {
++            HMODULE hModule = GetModuleHandleA("amdxc64.dll");
++            if ( hModule )
++            {
++                typedef HRESULT(__cdecl* PFNAmdExtD3DCreateInterface)( IUnknown* pOuter, REFIID riid, void** ppvObject );
++                PFNAmdExtD3DCreateInterface AmdExtD3DCreateInterface = static_cast<PFNAmdExtD3DCreateInterface>( (VOID*)GetProcAddress(hModule, "AmdExtD3DCreateInterface") );
++                if ( AmdExtD3DCreateInterface )
++                {
++                    hr = AmdExtD3DCreateInterface( device, __uuidof(IAmdExtAntiLagApi), (void**)&context->m_pAntiLagAPI );
++                    if ( hr == S_OK && context->m_pAntiLagAPI )
++                    {
++                        APIData_v1 data = {};
++                        data.uiSize = sizeof(data);
++                        data.uiVersion = 1;
++                        data.eMode = 2; // Anti-Lag 2.0 is disabled during initialization
++                        data.sControlStr = nullptr;
++                        data.uiControlStrLength = 0;
++                        data.maxFPS = 0;
++
++                        hr = context->m_pAntiLagAPI->UpdateAntiLagState( &data );
++                    }
++
++                    if ( hr != S_OK )
++                    {
++                        DeInitialize( context );
++                    }
++                }
++            }
++            else
++            {
++                hr = E_HANDLE;
++            }
++        }
++        return hr;
++    }
++
++    inline ULONG DeInitialize( Context* context )
++    {
++        ULONG refCount = 0;
++        if ( context )
++        {
++            if ( context->m_pAntiLagAPI )
++            {
++                refCount = context->m_pAntiLagAPI->Release();
++                context->m_pAntiLagAPI = nullptr;
++            }
++            context->m_enabled = false;
++        }
++
++        return refCount;
++    }
++
++    inline HRESULT Update( Context* context, bool enabled, unsigned int maxFPS )
++    {
++        // This function needs to be called once per frame, before the user input
++        // is sampled - or optionally also when the UI settings are modified.
++        if ( context && context->m_pAntiLagAPI )
++        {
++            // Update the Anti-Lag 2.0 internal state only when necessary:
++            if ( context->m_enabled != enabled || context->m_maxFPS != maxFPS )
++            {
++                context->m_enabled = enabled;
++                context->m_maxFPS = maxFPS;
++
++                APIData_v1 data = {};
++                data.uiSize = sizeof(data);
++                data.uiVersion = 1;
++                data.eMode = enabled ? 1 : 2;
++                data.sControlStr = nullptr;
++                data.uiControlStrLength = 0;
++                data.maxFPS = maxFPS;
++
++                // Only call the function with non-null arguments when setting state.
++                // Make sure not to set the state every frame.
++                context->m_pAntiLagAPI->UpdateAntiLagState( &data );
++            }
++
++            // Call the function with a nullptr to insert the latency-reducing delay.
++            // (if the state has not been set to 'enabled' this call will have no effect)
++            HRESULT hr = context->m_pAntiLagAPI->UpdateAntiLagState( nullptr );
++            if ( hr == S_OK || hr == S_FALSE )
++            {
++                return S_OK;
++            }
++            else
++            {
++                return hr;
++            }
++        }
++        else
++        {
++            return E_NOINTERFACE;
++        }
++    }
++
++    // Internal helper function
++    inline HRESULT SetFrameGenParamsInternal( Context* context, APIData_v2::Flags flags )
++    {
++        if ( context && context->m_pAntiLagAPI )
++        {
++            APIData_v2 data = {};
++            data.uiSize = sizeof(data);
++            data.uiVersion = 2;
++            data.flags = flags;
++            data.iiFrameIdx = 0;
++
++            return context->m_pAntiLagAPI->UpdateAntiLagState( &data );
++        }
++        else
++        {
++            return E_NOINTERFACE;
++        }
++    }
++
++    inline HRESULT MarkEndOfFrameRendering( Context* context )
++    {
++        APIData_v2::Flags flags   = {};
++        flags.signalEndOfFrameIdx = 1;
++        return SetFrameGenParamsInternal( context, flags );
++    }
++
++    inline HRESULT SetFrameGenFrameType( Context* context, bool bInterpolatedFrame )
++    {
++        APIData_v2::Flags flags   = {};
++        flags.signalFgFrameType   = 1;
++        flags.isInterpolatedFrame = bInterpolatedFrame ? 1 : 0;
++        return SetFrameGenParamsInternal( context, flags );
++    }
++} // namespace AntiLag2DX12
++} // namespace AMD
+\ No newline at end of file
