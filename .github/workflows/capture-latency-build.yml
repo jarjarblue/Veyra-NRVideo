@@ -12,6 +12,8 @@ jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 60
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
         with:
@@ -63,5 +65,6 @@ jobs:
             out/capture-ci/options.json
             out/capture-ci/build/CMakeFiles/CMakeConfigureLog.yaml
             out/capture-ci/BUILD_RESULT.json
+            out/capture-ci/startup-smoke.txt
           if-no-files-found: warn
           retention-days: 7
