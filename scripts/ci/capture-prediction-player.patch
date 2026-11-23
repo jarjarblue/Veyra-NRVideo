@@ -367,7 +367,7 @@ index 0000000..0c46378
 +}
 diff --git a/src/engine/CapturePredictionSession.cpp b/src/engine/CapturePredictionSession.cpp
 new file mode 100644
-index 0000000..64139d7
+index 0000000..51550b8
 --- /dev/null
 +++ b/src/engine/CapturePredictionSession.cpp
 @@ -0,0 +1,148 @@
@@ -421,7 +421,7 @@ index 0000000..64139d7
 +    for(unsigned i=0;i<2;++i){
 +        p.linear[i]=makeTexture(device,p.width,p.height,DXGI_FORMAT_R16G16B16A16_FLOAT,true);
 +        p.predicted[i]=makeTexture(device,p.width,p.height,DXGI_FORMAT_R16G16B16A16_FLOAT,true);
-+        p.flowColor[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_B8G8R8A8_UNORM,true);
++        p.flowColor[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_R8G8B8A8_UNORM,true);
 +        p.motion[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_R16G16_FLOAT,true);
 +        p.confidence[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_R16_FLOAT,true);
 +        if(!p.linear[i]||!p.predicted[i]||!p.flowColor[i]||!p.motion[i]||!p.confidence[i])return false;
@@ -435,7 +435,7 @@ index 0000000..64139d7
 +        const unsigned slot=(source*2+i)*3;
 +        stage.stageSrv(inputs[source],nullptr,p.ingress.heap.Get(),slot);
 +        makeUav(device,p.linear[i].Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpuHandleOf(p.ingress,slot+1));
-+        makeUav(device,p.flowColor[i].Get(),DXGI_FORMAT_B8G8R8A8_UNORM,cpuHandleOf(p.ingress,slot+2));
++        makeUav(device,p.flowColor[i].Get(),DXGI_FORMAT_R8G8B8A8_UNORM,cpuHandleOf(p.ingress,slot+2));
 +    }
 +    for(unsigned i=0;i<2;++i)if(!p.predict[i].initialize(device,{p.linear[i].Get(),p.linear[1-i].Get(),p.motion[i].Get(),p.motion[1-i].Get(),p.confidence[i].Get()},
 +        {p.predicted[0].Get(),p.predicted[1].Get()}))return false;
@@ -742,6 +742,19 @@ index 8e4a2e1..1c3d5c6 100644
  
  CommandSlotRing::~CommandSlotRing()
  {
+diff --git a/src/guidance/GpuDisOpticalFlow.cpp b/src/guidance/GpuDisOpticalFlow.cpp
+index a58f9a5..2a77ae8 100644
+--- a/src/guidance/GpuDisOpticalFlow.cpp
++++ b/src/guidance/GpuDisOpticalFlow.cpp
+@@ -55,7 +55,7 @@ bool GpuDisOpticalFlow::dispatch(ID3D12GraphicsCommandList* list,ID3D12CommandQu
+     ID3D12Resource* inputs[]={previous,current};
+     for(UINT i=0;i<2;++i){
+         const auto d=inputs[i]->GetDesc();
+-        if(d.Width!=p.w||d.Height!=p.h||d.Format!=DXGI_FORMAT_B8G8R8A8_UNORM){log::error("gpu-dis","BGRA input geometry/format mismatch");return false;}
++        if(d.Width!=p.w||d.Height!=p.h||(d.Format!=DXGI_FORMAT_B8G8R8A8_UNORM&&d.Format!=DXGI_FORMAT_R8G8B8A8_UNORM)){log::error("gpu-dis","RGBA/BGRA input geometry/format mismatch");return false;}
+         p.srv(s.convert,i,inputs[i]);
+         states.transition(list,inputs[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         states.transition(list,s.luma[i].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 diff --git a/src/ui/QmlPlayerBridge.cpp b/src/ui/QmlPlayerBridge.cpp
 index 259d216..3ce1dea 100644
 --- a/src/ui/QmlPlayerBridge.cpp
@@ -855,10 +868,18 @@ index 28b9ca0..12efbe8 100644
          p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
      emit presentationChanged();
 diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
-index fda708a..43df0d5 100644
+index fda708a..98b8c5c 100644
 --- a/tests/integration/CapturePredictionGpuTests.cpp
 +++ b/tests/integration/CapturePredictionGpuTests.cpp
-@@ -112,6 +112,7 @@ struct Test {
+@@ -57,6 +57,7 @@ struct Test {
+         hr(list->Close(),"close list");ID3D12CommandList* work[]={list.Get()};queue->ExecuteCommandLists(1,work);
+         hr(queue->Signal(fence.Get(),++value),"signal");hr(fence->SetEventOnCompletion(value,event),"set event");
+         require(WaitForSingleObject(event,30000)==WAIT_OBJECT_0,"bounded diagnostic wait");
++        if(FAILED(device->GetDeviceRemovedReason()))checkDebug();
+         hr(device->GetDeviceRemovedReason(),"device health");
+     }
+     void upload(ID3D12Resource* texture,const std::vector<uint8_t>& bytes) {
+@@ -112,6 +113,7 @@ struct Test {
      }
  };
  }
@@ -866,7 +887,7 @@ index fda708a..43df0d5 100644
  int main() try {
      Test t;unsigned checks=0;
      auto check=[&](bool ok,const char* what){++checks;require(ok,what);};
-@@ -162,3 +163,4 @@ int main() try {
+@@ -162,3 +164,4 @@ int main() try {
          <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
      return 0;
  } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
