@@ -1,0 +1,73 @@
+name: GPU capture prediction Windows player
+on:
+  push:
+    branches: ['codex/gpu-capture-prediction']
+    paths: ['scripts/ci/capture-prediction-player.patch', '.github/workflows/capture-prediction-player.yml', 'scripts/ci/stage-prediction-build.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-player:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          persist-credentials: false
+      - name: Apply reviewed source deltas
+        run: |
+          git apply --check scripts/ci/latency-source.patch
+          git apply scripts/ci/latency-source.patch
+          git apply --check scripts/ci/capture-prediction-cmake.patch
+          git apply scripts/ci/capture-prediction-cmake.patch
+          git apply --check scripts/ci/capture-prediction-player.patch
+          git apply scripts/ci/capture-prediction-player.patch
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005
+        with:
+          version: '6.8.3'
+          arch: 'win64_msvc2022_64'
+          cache: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            out/capture-ci/downloads
+            out/capture-ci/deps
+          key: veyra-capture-dependencies-v1
+      - name: Prepare pinned original runtime and configure
+        run: python scripts/ci/prepare-capture-build.py
+      - name: Build the complete player and prediction tests
+        timeout-minutes: 15
+        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests veyra_qml_quick_tests
+      - name: Verify controller and actual estimated-motion prediction
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = "$pwd/out/capture-ci/donor/Veyra-2.1.9-AMD-win64-portable;$env:PATH"
+          out/capture-ci/build/veyra_capture_prediction_tests.exe
+          out/capture-ci/build/veyra_capture_prediction_gpu_tests.exe
+          out/capture-ci/build/veyra_capture_prediction_session_tests.exe
+          python -B scripts/i18n/extract.py --check
+      - name: Verify controls and ownership
+        env:
+          QT_QUICK_BACKEND: software
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          Copy-Item -Recurse tests/qml/quick out/capture-ci/build/qml-tests
+          out/capture-ci/build/veyra_qml_quick_tests.exe AmdLatencyOwnership::test_defaults_and_shared_preference AmdLatencyOwnership::test_xess_never_offers_stacked_anti_lag
+      - name: Stage portable prediction player and startup check
+        run: python scripts/ci/stage-prediction-build.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Veyra-AMD-GPU-Capture-Prediction-Player
+          path: |
+            out/capture-ci/package.zip
+            out/capture-ci/BUILD_RESULT.json
+            out/capture-ci/startup-smoke.txt
+          retention-days: 14

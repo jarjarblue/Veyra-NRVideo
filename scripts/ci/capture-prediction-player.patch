@@ -1,0 +1,811 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 866cb0e..ce718f0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -348,6 +348,7 @@ veyra_add_compute_shader(veyra_shader_nr_reuse_warp NrReuseWarp)
+ veyra_add_compute_shader(veyra_shader_capture_prediction_scene CapturePredictionScene)
+ veyra_add_compute_shader(veyra_shader_capture_prediction_prepare CapturePredictionPrepare)
+ veyra_add_compute_shader(veyra_shader_capture_prediction_warp CapturePredictionWarp)
++veyra_add_compute_shader(veyra_shader_capture_prediction_ingress CapturePredictionIngress)
+ 
+ # Independent development core: no proprietary runtime, Qt or FFmpeg required.
+ add_library(veyra_capture_prediction STATIC src/pipeline/CapturePredictionPass.cpp)
+@@ -1553,6 +1554,11 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+ 
+   # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
+   add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
++  target_sources(veyra_engine PRIVATE src/engine/CapturePredictionSession.cpp)
++  add_executable(veyra_capture_prediction_session_tests tests/integration/CapturePredictionSessionTests.cpp)
++  target_link_libraries(veyra_capture_prediction_session_tests PRIVATE veyra_engine)
++  target_link_libraries(veyra_engine PUBLIC veyra_capture_prediction)
++  add_dependencies(veyra_engine veyra_shader_capture_prediction_ingress)
+   target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
+     src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
+   target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
+diff --git a/include/veyra/engine/CapturePredictionSession.h b/include/veyra/engine/CapturePredictionSession.h
+new file mode 100644
+index 0000000..9499108
+--- /dev/null
++++ b/include/veyra/engine/CapturePredictionSession.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++#include "veyra/engine/CapturePrediction.h"
++#include "veyra/engine/PresentationSettings.h"
++#include "veyra/pipeline/FrameBatch.h"
++#include <memory>
++#include <string>
++namespace veyra::engine {
++class CapturePredictionSession {
++public:
++    CapturePredictionSession();
++    ~CapturePredictionSession();
++    bool initialize(ID3D12Device*, ID3D12Resource* first, ID3D12Resource* second);
++    void configure(PresentationSettings settings);
++    void reset();
++    // Same presentation queue/command list as the final blit. No CPU wait or
++    // source buffering. Returns a linear surface, or null for original input.
++    ID3D12Resource* record(ID3D12GraphicsCommandList*,ID3D12CommandQueue*,ID3D12Fence*,uint64_t completion,
++        unsigned sourceSlot,pipeline::FrameIdentity,int64_t pts,int64_t arrival,int64_t now,bool refresh);
++    ID3D12Resource* output(unsigned index) const;
++    bool due(int64_t now) const;
++    void presented(int64_t now);
++    void gpuCost(double milliseconds);
++    std::wstring status() const;
++private:
++    struct Impl; std::unique_ptr<Impl> p_;
++};
++}
+diff --git a/include/veyra/engine/PresentationSettings.h b/include/veyra/engine/PresentationSettings.h
+index c8488d2..64be936 100644
+--- a/include/veyra/engine/PresentationSettings.h
++++ b/include/veyra/engine/PresentationSettings.h
+@@ -31,8 +31,11 @@ struct PresentationSettings {
+     NvidiaLowLatency nvidiaLowLatency=NvidiaLowLatency::Off;
+     bool amdAntiLag=false; // opt-in, native presentation only; XeSS owns XeLL
+     bool xessResponsiveFallback=false; // opt-in capture fallback pacing
++    bool capturePrediction=false;
++    double predictionLeadMs=8, predictionRefreshHz=120, predictionMaxHorizonMs=33;
++    bool predictionProtectHud=true;
+     bool operator==(const PresentationSettings&) const = default;
+-    bool valid()const{return unsigned(mode)<=2&&unsigned(display)<=2&&unsigned(outputRate)<=2&&unsigned(nvidiaLowLatency)<=1&&std::isfinite(customFps)&&customFps>=1.0&&customFps<=1000.0;}
++    bool valid()const{return unsigned(mode)<=2&&unsigned(display)<=2&&unsigned(outputRate)<=2&&unsigned(nvidiaLowLatency)<=1&&std::isfinite(customFps)&&customFps>=1.0&&customFps<=1000.0&&std::isfinite(predictionLeadMs)&&predictionLeadMs>=0&&predictionLeadMs<=30&&std::isfinite(predictionRefreshHz)&&predictionRefreshHz>=30&&predictionRefreshHz<=240&&std::isfinite(predictionMaxHorizonMs)&&predictionMaxHorizonMs>=1&&predictionMaxHorizonMs<=50;}
+ };
+ // Who owns the low queue in the interface: on an NVIDIA adapter the two
+ // NVIDIA states (开 implies it, 关 clears it); on another adapter the
+diff --git a/include/veyra/engine/VideoPresenter.h b/include/veyra/engine/VideoPresenter.h
+index 94ea280..3e777e0 100644
+--- a/include/veyra/engine/VideoPresenter.h
++++ b/include/veyra/engine/VideoPresenter.h
+@@ -10,6 +10,7 @@
+ #include "veyra/gfx/AntiLagSession.h"
+ #include "veyra/gfx/NvidiaVrr.h"
+ #include "veyra/engine/PresentationSettings.h"
++#include "veyra/engine/CapturePredictionSession.h"
+ #include "veyra/engine/PresentCapture.h"
+ #include "veyra/engine/DisplayStateService.h"
+ #include <chrono>
+@@ -30,7 +31,9 @@ public:
+     // source (file playback). Retained for diagnostics; XeLL low latency must
+     // stay enabled or the provider refuses generation (result -15).
+     bool open(gfx::D3D12DeviceContext&, HWND, pipeline::EnhanceGraph&, bool captureCompatible=false, bool mediaClockPaced=false);
+-    bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false);
++    bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false,int64_t captureArrival100ns=0,bool predictionRefresh=false);
++    bool refreshPrediction(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,PreviewView);
++    std::wstring capturePredictionStatus() const;
+     void close();
+     // Owner-thread graph replacement boundary. Native DXGI remains attached to
+     // its HWND; provider-owned presentation must be shut down before its graph.
+@@ -130,6 +133,11 @@ private:
+     DXGI_HDR_METADATA_HDR10 lastMetadata_{};
+     gfx::ReflexSession reflex_;
+     gfx::AntiLagSession antiLag_{gfx::nativeAntiLagApi()};
++    std::unique_ptr<CapturePredictionSession> prediction_;
++    PresentationSettings predictionSettings_;
++    bool predictionUnavailable_=false;
++    uint64_t predictionCostEnd_=0;
++    struct PredictionSource { unsigned slot=0;pipeline::FrameIdentity identity{};int64_t pts=0,arrival=0;bool valid=false; } predictionSource_;
+     uint64_t reflexFrame_=0,reflexInputFrame_=0,generation_=0;
+     int64_t lastPresentCallHost100ns_=0;
+     bool providerOwnedPresentation_=false;
+diff --git a/include/veyra/gfx/CommandSlotRing.h b/include/veyra/gfx/CommandSlotRing.h
+index 3b77944..253ca50 100644
+--- a/include/veyra/gfx/CommandSlotRing.h
++++ b/include/veyra/gfx/CommandSlotRing.h
+@@ -56,6 +56,8 @@ public:
+         if(!slotCount_){status=Status::InvalidArgument;return nullptr;}
+         slot=nextSlot_++%slotCount_;return acquire(slot,status);
+     }
++    // Optional prediction refreshes never block on an allocator/fence.
++    bool nextSlotReady() const;
+ 
+     // Closes, submits and signals the slot; advances the fence timeline.
+     bool submitAndSignal(uint32_t slot);
+diff --git a/include/veyra/ui/QmlPlayerBridge.h b/include/veyra/ui/QmlPlayerBridge.h
+index 6b854dc..5f73df8 100644
+--- a/include/veyra/ui/QmlPlayerBridge.h
++++ b/include/veyra/ui/QmlPlayerBridge.h
+@@ -80,6 +80,11 @@ class QmlPlayerBridge : public QObject {
+     Q_PROPERTY(bool amdAntiLag READ amdAntiLag WRITE setAmdAntiLag NOTIFY presentationChanged)
+     Q_PROPERTY(bool amdAntiLagAvailable READ amdAntiLagAvailable NOTIFY effectCapabilitiesChanged)
+     Q_PROPERTY(bool xessResponsiveFallback READ xessResponsiveFallback WRITE setXessResponsiveFallback NOTIFY presentationChanged)
++    Q_PROPERTY(bool capturePrediction READ capturePrediction WRITE setCapturePrediction NOTIFY presentationChanged)
++    Q_PROPERTY(double predictionLeadMs READ predictionLeadMs WRITE setPredictionLeadMs NOTIFY presentationChanged)
++    Q_PROPERTY(double predictionRefreshHz READ predictionRefreshHz WRITE setPredictionRefreshHz NOTIFY presentationChanged)
++    Q_PROPERTY(double predictionMaxHorizonMs READ predictionMaxHorizonMs WRITE setPredictionMaxHorizonMs NOTIFY presentationChanged)
++    Q_PROPERTY(bool predictionProtectHud READ predictionProtectHud WRITE setPredictionProtectHud NOTIFY presentationChanged)
+     Q_PROPERTY(int nvidiaLowLatency READ nvidiaLowLatency WRITE setNvidiaLowLatency NOTIFY presentationChanged)
+     Q_PROPERTY(bool nvidiaLowLatencyAvailable READ nvidiaLowLatencyAvailable NOTIFY effectCapabilitiesChanged)
+ 
+@@ -703,6 +708,16 @@ public:
+     bool amdAntiLagAvailable() const;
+     bool xessResponsiveFallback() const;
+     void setXessResponsiveFallback(bool value);
++    bool capturePrediction()const;
++    void setCapturePrediction(bool value);
++    double predictionLeadMs()const;
++    void setPredictionLeadMs(double value);
++    double predictionRefreshHz()const;
++    void setPredictionRefreshHz(double value);
++    double predictionMaxHorizonMs()const;
++    void setPredictionMaxHorizonMs(double value);
++    bool predictionProtectHud()const;
++    void setPredictionProtectHud(bool value);
+     int nvidiaLowLatency() const;
+     void setNvidiaLowLatency(int value);
+     bool nvidiaLowLatencyAvailable() const;
+diff --git a/qml/Veyra/CapturePredictionEditor.qml b/qml/Veyra/CapturePredictionEditor.qml
+new file mode 100644
+index 0000000..997736d
+--- /dev/null
++++ b/qml/Veyra/CapturePredictionEditor.qml
+@@ -0,0 +1,66 @@
++import QtQuick
++import QtQuick.Layouts
++ColumnLayout {
++    id: root
++    property var backend: veyra
++    property string namePrefix: "list"
++    Layout.fillWidth: true
++    spacing: 4
++    VRow {
++        label: qsTr("GPU capture prediction")
++        hintBelow: true
++        hint: qsTr("Experimental live preview. Uses observed motion to predict ahead without waiting for future frames. Enabling turns interpolation off and selects minimum capture buffering. Reopen capture to apply its allocator setting.")
++        VSwitch {
++            objectName: root.namePrefix+"-capture-prediction"
++            checked: root.backend.capturePrediction === true
++            onToggled: checked => root.backend.capturePrediction=checked
++        }
++    }
++    ColumnLayout {
++        visible: root.backend.capturePrediction === true
++        Layout.fillWidth: true
++        VRow {
++            label: qsTr("Estimated compensation")
++            value: Number(root.backend.predictionLeadMs ?? 8).toFixed(1)+" ms"
++            VSlider {
++                objectName: root.namePrefix+"-prediction-lead"
++                width: 140; from: 0; to: 30; stepSize: .5; live: false; valueFromModel: true
++                value: root.backend.predictionLeadMs ?? 8
++                onMoved: value => root.backend.predictionLeadMs=value
++            }
++        }
++        VRow {
++            label: qsTr("Prediction refresh rate")
++            value: Number(root.backend.predictionRefreshHz ?? 120).toFixed(0)+" Hz"
++            VSlider {
++                objectName: root.namePrefix+"-prediction-refresh"
++                width: 140; from: 30; to: 240; stepSize: 1; live: false; valueFromModel: true
++                value: root.backend.predictionRefreshHz ?? 120
++                onMoved: value => root.backend.predictionRefreshHz=value
++            }
++        }
++        VRow {
++            label: qsTr("Maximum prediction horizon")
++            value: Number(root.backend.predictionMaxHorizonMs ?? 33).toFixed(0)+" ms"
++            VSlider {
++                objectName: root.namePrefix+"-prediction-horizon"
++                width: 140; from: 1; to: 50; stepSize: 1; live: false; valueFromModel: true
++                value: root.backend.predictionMaxHorizonMs ?? 33
++                onMoved: value => root.backend.predictionMaxHorizonMs=value
++            }
++        }
++        VRow {
++            label: qsTr("Protect HUD corners and reticle")
++            VSwitch {
++                objectName: root.namePrefix+"-prediction-hud"
++                checked: root.backend.predictionProtectHud !== false
++                onToggled: checked => root.backend.predictionProtectHud=checked
++            }
++        }
++        Text {
++            Layout.fillWidth: true
++            text: qsTr("Start with 8 ms at 120 Hz. Larger forecasts can distort motion. Uncertain areas use the latest image; unseen input and geometry cannot be recovered. Compensation is an estimate, not measured latency removed.")
++            color: Theme.t3; font.pixelSize: 11; wrapMode: Text.WordWrap
++        }
++    }
++}
+diff --git a/qml/Veyra/NodePage.qml b/qml/Veyra/NodePage.qml
+index 1f05525..3087560 100644
+--- a/qml/Veyra/NodePage.qml
++++ b/qml/Veyra/NodePage.qml
+@@ -1681,6 +1681,7 @@ VPage {
+                 }
+                 NvidiaLowLatencyEditor { namePrefix: "node" }
+                             AmdLatencyEditor { namePrefix: "node" }
++                CapturePredictionEditor { namePrefix: "node" }
+                 VRow {
+                     visible: !veyra.nvidiaLowLatencyAvailable
+                     label: qsTr("低延迟队列")
+diff --git a/qml/Veyra/ProPage.qml b/qml/Veyra/ProPage.qml
+index 6ed5bf5..2d20e45 100644
+--- a/qml/Veyra/ProPage.qml
++++ b/qml/Veyra/ProPage.qml
+@@ -1723,6 +1723,8 @@ VPage {
+                         visible: root.tab === "fg"
+                         objectName: "list-fg-group"
+ 
++                        CapturePredictionEditor { namePrefix: "list" }
++
+                         VAccordion {
+                             id: fgCard
+                             objectName: "list-fg-card"
+diff --git a/shaders/CapturePredictionIngress.hlsl b/shaders/CapturePredictionIngress.hlsl
+new file mode 100644
+index 0000000..0c46378
+--- /dev/null
++++ b/shaders/CapturePredictionIngress.hlsl
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "HdrColor.hlsli"
++Texture2D<float4> Input : register(t0);
++RWTexture2D<float4> Linear : register(u0);
++RWTexture2D<float4> FlowColor : register(u1);
++SamplerState LinearClamp : register(s1);
++cbuffer Dims : register(b0) {
++    uint Width, Height, FlowWidth, FlowHeight;
++    uint Transfer; uint3 Padding;
++};
++float3 decode(float3 c) {
++    if(Transfer==2)return HdrDecodePq(c);
++    if(Transfer==1)return c;
++    c=max(c,0);
++    return select(c<=.04045,c/12.92,pow((c+.055)/1.055,2.4));
++}
++[numthreads(8,8,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    if(id.x<Width&&id.y<Height){float4 c=Input[id.xy];Linear[id.xy]=float4(decode(c.rgb),c.a);}
++    if(id.x<FlowWidth&&id.y<FlowHeight){
++        float3 c=Input.SampleLevel(LinearClamp,(float2(id.xy)+.5)/float2(FlowWidth,FlowHeight),0).rgb;
++        if(Transfer!=0){c=max(decode(c),0);c=c/(1+c);c=pow(c,1.0/2.2);}
++        FlowColor[id.xy]=float4(saturate(c),1);
++    }
++}
+diff --git a/src/engine/CapturePredictionSession.cpp b/src/engine/CapturePredictionSession.cpp
+new file mode 100644
+index 0000000..defa17f
+--- /dev/null
++++ b/src/engine/CapturePredictionSession.cpp
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "veyra/engine/CapturePredictionSession.h"
++#include "veyra/pipeline/CapturePredictionPass.h"
++#include "veyra/guidance/GpuDisOpticalFlow.h"
++#include <dxgi1_4.h>
++#include <bit>
++#include <format>
++namespace veyra::engine {
++using namespace pipeline;
++struct CapturePredictionSession::Impl {
++    PresentationSettings settings;
++    CapturePredictionClock clock;
++    CapturePredictionClock::Source latest{};
++    PredictionDecision decision;
++    FrameIdentity identity{};
++    ComputePass ingress;
++    StateTracker states;
++    ComPtr<ID3D12Resource> linear[2],flowColor[2],motion[2],confidence[2],predicted[2];
++    CapturePredictionPass predict[2];
++    guidance::GpuDisOpticalFlow flow;
++    uint32_t width=0,height=0,fw=0,fh=0,transfer=0;
++    unsigned parity=1;
++    uint64_t sequence=0,outputs=0;
++    int64_t lastPresent=0,lastArrival=0,nextRefresh=0;
++    double ageMs=0,lastCost=0;
++    bool valid=false,initialized=false,failed=false,newInput=false;
++};
++CapturePredictionSession::CapturePredictionSession():p_(std::make_unique<Impl>()){}
++CapturePredictionSession::~CapturePredictionSession()=default;
++bool CapturePredictionSession::initialize(ID3D12Device* device,ID3D12Resource* a,ID3D12Resource* b){
++    auto& p=*p_;if(!device||!a||!b)return false;
++    const auto d=a->GetDesc(),other=b->GetDesc();
++    if(!d.Width||!d.Height||d.Width>3840||d.Height>2160||other.Width!=d.Width||other.Height!=d.Height||other.Format!=d.Format)return false;
++    if(d.Format!=DXGI_FORMAT_R8G8B8A8_UNORM&&d.Format!=DXGI_FORMAT_B8G8R8A8_UNORM&&d.Format!=DXGI_FORMAT_R10G10B10A2_UNORM&&d.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT)return false;
++    p.width=uint32_t(d.Width);p.height=d.Height;
++    const double scale=std::min(1.,640./std::max(p.width,p.height));
++    p.fw=std::max(32u,uint32_t(p.width*scale));p.fh=std::max(32u,uint32_t(p.height*scale));
++    p.transfer=d.Format==DXGI_FORMAT_R10G10B10A2_UNORM?2:d.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?1:0;
++    // Include conservative DIS scratch allowance, in addition to our surfaces.
++    const uint64_t need=uint64_t(p.width)*p.height*32+uint64_t(p.fw)*p.fh*96+64*1024*1024;
++    ComPtr<IDXGIFactory4> factory;ComPtr<IDXGIAdapter3> adapter;
++    if(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))&&SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(),IID_PPV_ARGS(&adapter)))){
++        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
++        if(SUCCEEDED(adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))&&memory.Budget>0&&
++            (memory.CurrentUsage>=memory.Budget||need>memory.Budget-memory.CurrentUsage)){log::warn("capture-prediction","insufficient local video-memory budget; original frames retained");return false;}
++    }
++    for(unsigned i=0;i<2;++i){
++        p.linear[i]=makeTexture(device,p.width,p.height,DXGI_FORMAT_R16G16B16A16_FLOAT,true);
++        p.predicted[i]=makeTexture(device,p.width,p.height,DXGI_FORMAT_R16G16B16A16_FLOAT,true);
++        p.flowColor[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_B8G8R8A8_UNORM,true);
++        p.motion[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_R16G16_FLOAT,true);
++        p.confidence[i]=makeTexture(device,p.fw,p.fh,DXGI_FORMAT_R16_FLOAT,true);
++        if(!p.linear[i]||!p.predicted[i]||!p.flowColor[i]||!p.motion[i]||!p.confidence[i])return false;
++    }
++    if(!p.flow.initialize(device,p.fw,p.fh))return false;
++    std::vector<uint8_t> shader;
++    if(!p.ingress.loadShader("CapturePredictionIngress.dxil",shader)||!p.ingress.create(device,shader,12,1,2,8,0,true))return false;
++    DescriptorStager stage;if(!stage.initialize(device,32))return false;
++    ID3D12Resource* inputs[]={a,b};
++    for(unsigned source=0;source<2;++source)for(unsigned i=0;i<2;++i){
++        const unsigned slot=(source*2+i)*3;
++        stage.stageSrv(inputs[source],nullptr,p.ingress.heap.Get(),slot);
++        makeUav(device,p.linear[i].Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpuHandleOf(p.ingress,slot+1));
++        makeUav(device,p.flowColor[i].Get(),DXGI_FORMAT_B8G8R8A8_UNORM,cpuHandleOf(p.ingress,slot+2));
++    }
++    for(unsigned i=0;i<2;++i)if(!p.predict[i].initialize(device,{p.linear[i].Get(),p.linear[1-i].Get(),p.motion[i].Get(),p.motion[1-i].Get(),p.confidence[i].Get()},
++        {p.predicted[0].Get(),p.predicted[1].Get()}))return false;
++    p.initialized=true;
++    log::info("capture-prediction",std::format("GPU DIS + prediction initialized {}x{} flow={}x{}; native presentation, no future-frame wait",p.width,p.height,p.fw,p.fh));
++    return true;
++}
++void CapturePredictionSession::configure(PresentationSettings s){
++    if(p_->settings.capturePrediction!=s.capturePrediction)reset();p_->settings=s;
++}
++void CapturePredictionSession::reset(){auto& p=*p_;p.clock.clear();p.identity={};p.valid=false;p.sequence=0;p.lastPresent=0;p.nextRefresh=0;p.newInput=false;p.decision={};}
++ID3D12Resource* CapturePredictionSession::record(ID3D12GraphicsCommandList* list,ID3D12CommandQueue* queue,ID3D12Fence* fence,uint64_t completion,
++    unsigned sourceSlot,FrameIdentity id,int64_t pts,int64_t arrival,int64_t now,bool refresh){
++    auto& p=*p_;if(!p.initialized||!p.settings.capturePrediction||p.failed||sourceSlot>=2||!list||!queue||!fence)return nullptr;
++    const bool fresh=!p.valid||id!=p.identity;
++    if(refresh&&fresh)return nullptr;
++    if(fresh){
++        const bool resetHistory=!p.valid||id.epoch!=p.identity.epoch||id.settingsRevision!=p.identity.settingsRevision;
++        const auto old=p.parity;p.parity^=1;
++        p.latest={id.epoch,id.settingsRevision,++p.sequence,pts,arrival,true,false,resetHistory};
++        const auto accepted=p.clock.accept(p.latest);
++        const bool history=!resetHistory&&accepted==PredictionReason::Ready;
++        const uint32_t dims[8]={p.width,p.height,p.fw,p.fh,p.transfer,0,0,0};
++        const unsigned slot=(sourceSlot*2+p.parity)*3;
++        // The producer handoff is GPU-side; both graph outputs are COMMON here.
++        p.states.transition(list,p.linear[p.parity].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        p.states.transition(list,p.flowColor[p.parity].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        p.ingress.bind(list,reinterpret_cast<const float*>(dims),gpuHandleOf(p.ingress,slot).ptr,gpuHandleOf(p.ingress,slot+1).ptr);
++        // Caller transitions the graph input to NON_PIXEL_SHADER_RESOURCE.
++        list->Dispatch((p.width+7)/8,(p.height+7)/8,1);
++        p.states.uavBarrier(list,p.linear[p.parity].Get());p.states.uavBarrier(list,p.flowColor[p.parity].Get());
++        p.states.transition(list,p.linear[p.parity].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        p.states.transition(list,p.flowColor[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
++        if(history){
++            p.states.transition(list,p.flowColor[old].Get(),D3D12_RESOURCE_STATE_COMMON);
++            p.states.transition(list,p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
++            p.states.transition(list,p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
++            if(!p.flow.dispatch(list,queue,fence,completion,p.parity,p.flowColor[old].Get(),p.flowColor[p.parity].Get(),p.motion[p.parity].Get(),p.confidence[p.parity].Get(),p.sequence-1,p.sequence)){
++                p.clock.clear();p.decision.reason=PredictionReason::Warmup;p.valid=false;return nullptr;
++            }
++            p.states.set(p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);p.states.set(p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
++        }
++        p.identity=id;p.valid=true;p.lastArrival=arrival;p.newInput=true;
++    }
++    CapturePredictionSettings settings;settings.enabled=true;settings.compensationMs=p.settings.predictionLeadMs;
++    settings.maxHorizonMs=p.settings.predictionMaxHorizonMs;settings.maxIntervalFraction=1;
++    settings.displayPeriodMs=1000/p.settings.predictionRefreshHz;settings.maxGpuMs=2;
++    p.decision=p.clock.decide(settings,now);p.ageMs=arrival>0&&now>=arrival?double(now-arrival)/10000:0;
++    if(!p.decision.active())return nullptr;
++    CapturePredictionPass::Parameters parameters;parameters.historyValid=true;parameters.accelerationValid=p.decision.acceleration;
++    parameters.horizonFraction=float(p.decision.intervalFraction);parameters.intervalRatio=float(p.decision.intervalRatio);
++    if(p.settings.predictionProtectHud)parameters.protectedRegions={{{0,0,1,.10f},{0,.76f,.25f,1},{.75f,.76f,1,1},{.478f,.478f,.522f,.522f}}};
++    const unsigned output=sourceSlot;
++    if(!p.predict[p.parity].record(list,p.states,output,parameters))return nullptr;
++    p.states.transition(list,p.predicted[output].Get(),D3D12_RESOURCE_STATE_COMMON);
++    ++p.outputs;return p.predicted[output].Get();
++}
++ID3D12Resource* CapturePredictionSession::output(unsigned i)const{return i<2?p_->predicted[i].Get():nullptr;}
++bool CapturePredictionSession::due(int64_t now)const{
++    const auto& p=*p_;return p.initialized&&p.valid&&p.settings.capturePrediction&&!p.failed&&
++        p.decision.active()&&p.nextRefresh>0&&now>=p.nextRefresh&&
++        now-p.lastArrival<1000000;
++}
++void CapturePredictionSession::presented(int64_t now){
++    auto& p=*p_;p.lastPresent=now;
++    const auto interval=std::max<int64_t>(1,int64_t(10000000/p.settings.predictionRefreshHz));
++    if(p.newInput||p.nextRefresh<=0){p.nextRefresh=now+interval;p.newInput=false;}
++    else if(p.nextRefresh<=now)p.nextRefresh+=((now-p.nextRefresh)/interval+1)*interval;
++}
++void CapturePredictionSession::gpuCost(double ms){p_->clock.gpuCost(ms);p_->lastCost=ms;}
++std::wstring CapturePredictionSession::status()const{
++    const auto& p=*p_;const wchar_t* state=p.decision.active()?L"active":p.decision.reason==PredictionReason::Budget?L"GPU budget bypass":p.decision.reason==PredictionReason::Stale?L"stale source bypass":L"warming up / original image";
++    return std::format(L"GPU capture prediction: {} | predicted horizon {:.1f} ms | PC ingress age {:.1f} ms | GPU {:.2f} ms | no added frame buffer (not measured latency saved)",state,p.decision.horizonMs,p.ageMs,p.lastCost);
++}
++}
+diff --git a/src/engine/EngineController.cpp b/src/engine/EngineController.cpp
+index 3e5bda7..fbd810e 100644
+--- a/src/engine/EngineController.cpp
++++ b/src/engine/EngineController.cpp
+@@ -1469,6 +1469,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+             const bool checkpointPresentation=GetEnvironmentVariableW(L"VEYRA_TEST_NO_PROCESS_PRESENT",nullptr,0)==0;
+             const bool capturePresentAfterReady=GetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_PRESENT_AFTER_READY",nullptr,0)>0;
+             bool processingGraph=false;
++            auto refreshCapturePrediction=[&]{
++                if(!isCapture||paused_||processingGraph||!presentationEffective.capturePrediction||!graph||
++                   (liveScheduler&&liveScheduler->occupancy())||!pendingCompletions.empty())return;
++                const auto before=presenter.submittedCount();
++                if(!presenter.refreshPrediction(ctx,ring,*graph,previewView())){
++                    status(L"GPU prediction presentation failed; close and reopen capture",true);return;
++                }
++                if(frameFlow&&presenter.submittedCount()>before)frameFlow->presented(true,presenter.consumerFenceValue(ring.lastSignaledValue()),host100ns());
++                {std::lock_guard lock(mutex_);snapshot_.presentationStatus=presenter.capturePredictionStatus();}
++            };
+             auto waitLive=[&]{
+                 const auto due=liveScheduler?liveScheduler->wakeAt():0;
+                 const auto arrivalEvent=physicalCapture?captureSource.frameEvent():nullptr;
+@@ -2076,7 +2086,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+                         advanceLive();publishWaitingProgress();waitLive();rs=physicalCapture?captureSource.tryRead(pkt,&frame):activeSource->read(pkt,&frame);
+                     }
+                     if(stop_)break;
+-                    if(rs==source::SourceReadStatus::Waiting){if(isScreen){std::lock_guard lock(mutex_);snapshot_.sourceNotice=screenSource.status();}advanceLive();publishWaitingProgress();waitLive();continue;}
++                    if(rs==source::SourceReadStatus::Waiting){if(isScreen){std::lock_guard lock(mutex_);snapshot_.sourceNotice=screenSource.status();}advanceLive();refreshCapturePrediction();publishWaitingProgress();waitLive();continue;}
+                     if(rs==source::SourceReadStatus::Eos){
+                         fileInputEnded=true;
+                         while(liveScheduler&&liveScheduler->occupancy()&&!stop_&&(!paused_||seekPreviewPending)&&!liveScheduler->failed()){advanceLive();if(liveScheduler->occupancy())waitLive();}
+@@ -2940,7 +2950,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+                             const auto begin=Clock::now();const auto before=presenter.submittedCount();
+                             presenter.reflexFrame(watch->reflexFrame);
+                             presenter.observeHdrCoverage(hdrCoverageObserved_.load());
+-                            if(!presenter.present(ctx,ring,*graph,item.lease->slot,generated,item.lease->referencesValid,comparisonMode_,comparisonBase_,comparisonSplit_,item.identity,previewView(),item.pts100ns))return {State::Failed};
++                            if(!presenter.present(ctx,ring,*graph,item.lease->slot,generated,item.lease->referencesValid,comparisonMode_,comparisonBase_,comparisonSplit_,item.identity,previewView(),item.pts100ns,false,captureArrival))return {State::Failed};
+                             const auto presentEndHost=host100ns();
+                             const double returnDeviation=deviationValid?nowMs()-itemPtsMs:0;
+                             item.lease->consumerFence=presenter.consumerFenceValue(ring.lastSignaledValue());const bool didPresent=presenter.submittedCount()>before;s.blit=presenter.blitTiming(ctx.fence());
+diff --git a/src/engine/VideoPresenter.cpp b/src/engine/VideoPresenter.cpp
+index b895839..9144a2d 100644
+--- a/src/engine/VideoPresenter.cpp
++++ b/src/engine/VideoPresenter.cpp
+@@ -93,7 +93,7 @@ bool VideoPresenter::open(gfx::D3D12DeviceContext& ctx,HWND window,pipeline::Enh
+     std::vector<uint8_t> vs,ps;
+     // The output pool contains both parities of every generated subframe.
+     // Comparison references follow it; derive offsets to cover VFG through 8X.
+-    if(!pipeline::loadShaderBytes("PresentBlit_vs.dxil",vs)||!pipeline::loadShaderBytes("PresentBlit_ps.dxil",ps)||!pass_.create(ctx.device(),vs,ps,pipeline::kOutputPoolSlots+8,graph.outputFormat(),16))return false;
++    if(!pipeline::loadShaderBytes("PresentBlit_vs.dxil",vs)||!pipeline::loadShaderBytes("PresentBlit_ps.dxil",ps)||!pass_.create(ctx.device(),vs,ps,pipeline::kOutputPoolSlots+10,graph.outputFormat(),16))return false;
+     if(sink_.xess()){
+         std::vector<uint8_t> cs;
+         if(!pipeline::loadShaderBytes("PresentMotion.dxil",cs)||!presentMotionPass_.create(ctx.device(),cs,4,1,1,16))return false;
+@@ -129,9 +129,22 @@ bool VideoPresenter::open(gfx::D3D12DeviceContext& ctx,HWND window,pipeline::Enh
+     if(!reuse)startDisplayState();
+     return true;
+ }
++std::wstring VideoPresenter::capturePredictionStatus()const{
++    if(predictionUnavailable_)return L"GPU capture prediction unavailable (GPU resources / supported output up to 3840x2160); showing original frames";
++    return prediction_?prediction_->status():L"GPU capture prediction: waiting for live capture; original images until motion history is ready";
++}
++bool VideoPresenter::refreshPrediction(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,pipeline::EnhanceGraph& graph,PreviewView view){
++    if(!predictionSettings_.capturePrediction||!prediction_||!predictionSource_.valid||!presentationQueue_||!presentationRing_.nextSlotReady())return true;
++    const auto now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()/100;
++    if(!prediction_->due(now)||!sink_.presentationReady()||GetPropW(window_,L"Veyra.InteractiveMove")||GetPropW(window_,L"Veyra.DpiTransition"))return true;
++    RECT rect{};if(!GetClientRect(window_,&rect)||unsigned(rect.right)!=viewWidth_||unsigned(rect.bottom)!=viewHeight_)return true;
++    const auto source=predictionSource_;
++    return present(ctx,ring,graph,source.slot,false,false,0,false,.5f,source.identity,view,source.pts,false,source.arrival,true);
++}
+ bool VideoPresenter::prepareGraphChange(){
+     if(sink_.xess()){close();return true;}
+     if(presentationRing_.initialized()&&!presentationRing_.drainQueue())return false;
++    prediction_.reset();predictionSource_={};predictionUnavailable_=false;predictionCostEnd_=0;
+     hasPresented_=false;retainedFrame_.reset();gpuTimer_.close();
+     // Retain metadataSent_: a new graph disabling metadata must clear the
+     // hint that is still attached to the retained DXGI chain.
+@@ -189,7 +202,7 @@ bool VideoPresenter::refresh(ID3D12Device* device){
+     }
+     return true;
+ }
+-bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& sharedRing,pipeline::EnhanceGraph& graph,unsigned slot,bool generated,bool referencesValid,int comparison,bool baseReference,float split,pipeline::FrameIdentity identity,PreviewView view,int64_t sourcePts100ns,bool retainUnchanged) {
++bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& sharedRing,pipeline::EnhanceGraph& graph,unsigned slot,bool generated,bool referencesValid,int comparison,bool baseReference,float split,pipeline::FrameIdentity identity,PreviewView view,int64_t sourcePts100ns,bool retainUnchanged,int64_t captureArrival100ns,bool predictionRefresh) {
+     const auto reflexFrame=reflexFrame_;reflexFrame_=0;
+     auto& ring=presentationQueue_?presentationRing_:sharedRing;
+     auto* fence=presentationFence_?presentationFence_.Get():ctx.fence();
+@@ -278,6 +291,38 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     gpuTimer_.frame(identity.sourceFrameId?identity:pipeline::FrameIdentity{0,0,submittedCount()+1},fence);gpuTimer_.mark(list,diagnostics::GpuStage::Blit);
+     uint32_t backBufferIndex=0;
+     auto* source=generated?graph.generatedFrameResource(slot):graph.videoFrameResource(slot);auto* bb=sink_.currentBackBuffer(&backBufferIndex);if(!bb)return false;
++    auto* graphSource=source;
++    ID3D12Resource* predictionSurface=nullptr;
++    if(predictionSettings_.capturePrediction&&!generated&&comparison==0&&slot<2&&captureArrival100ns>0){
++        if(!prediction_&&!predictionUnavailable_){
++            prediction_=std::make_unique<CapturePredictionSession>();
++            if(!prediction_->initialize(ctx.device(),graph.videoFrameResource(0),graph.videoFrameResource(1))){
++                prediction_.reset();predictionUnavailable_=true;
++                veyra::log::warn("capture-prediction","initialization failed; preserving original native frames");
++            }else{
++                prediction_->configure(predictionSettings_);
++                pipeline::DescriptorStager stage;
++                if(!stage.initialize(ctx.device(),4))return false;
++                for(unsigned i=0;i<2;++i)stage.stageSrv(prediction_->output(i),nullptr,pass_.heap.Get(),pipeline::kOutputPoolSlots+8+i);
++            }
++        }
++        if(prediction_){
++            const auto& cost=gpuTimer_.last().gpu[size_t(diagnostics::GpuStage::FgBatch)];
++            if(cost.state==diagnostics::SampleState::Measured&&cost.milliseconds&&cost.end!=predictionCostEnd_){
++                prediction_->gpuCost(*cost.milliseconds);predictionCostEnd_=cost.end;
++            }
++            gpuTimer_.mark(list,diagnostics::GpuStage::FgBatch);
++            pipeline::StateTracker inputState;
++            inputState.transition(list,graphSource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++            const auto stamp=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()/100;
++            predictionSurface=prediction_->record(list,ring.queue(),fence,ring.lastSignaledValue()+1,slot,identity,sourcePts100ns,captureArrival100ns,stamp,predictionRefresh);
++            inputState.transition(list,graphSource,D3D12_RESOURCE_STATE_COMMON);
++            gpuTimer_.mark(list,diagnostics::GpuStage::FgBatch,true);
++            if(predictionSurface)source=predictionSurface;
++            if(!predictionRefresh)predictionSource_={slot,identity,sourcePts100ns,captureArrival100ns,true};
++        }
++    }else if(!predictionRefresh){predictionSource_.valid=false;}
++    if(predictionRefresh&&!predictionSurface){ring.discardRecording();return true;}
+     auto* renderTarget=copyBeforePresent_?compositeTarget_.Get():bb;
+     if(!source||!renderTarget)return false;
+     D3D12_RESOURCE_BARRIER barriers[2]{};
+@@ -304,7 +349,8 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     // tuning, then encode back; disabled tuning keeps the original exact blit.
+     // Display tuning also applies after RTX Video HDR converted an SDR source.
+     const float curveFlag=(hdrCurve.enabled&&graph.hdrOutput())?16.0f:0.0f;
+-    const float mainFlags=samplingFlags+curveFlag+(curveFlag&&graph.hdr10Output()?36.0f:0.0f);
++    const float mainFlags=predictionSurface?(samplingFlags+curveFlag+(graph.hdr10Output()?4.f:graph.hdrOutput()?0.f:1.f)):
++        samplingFlags+curveFlag+(curveFlag&&graph.hdr10Output()?36.0f:0.0f);
+     float dims[16]={renderW,renderH,mainFlags,inverseFit,float(rc.right),float(rc.bottom),view.centerX,view.centerY};
+     dims[8]=float(hdrCurve.shadowLiftEv100)/100.0f;
+     dims[9]=float(hdrCurve.shadowRangeNits);
+@@ -318,10 +364,11 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     }
+     dims[14]=0.0f;dims[15]=0.0f;
+     list->SetGraphicsRoot32BitConstants(0,16,dims,0);
+-    list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot+(generated?2:0))*pass_.increment});
++    list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+
++        size_t(predictionSurface?pipeline::kOutputPoolSlots+8+slot:slot+(generated?2:0))*pass_.increment});
+     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);
+     bool probeIssued=false;
+-    const bool observe=probeObserved_&&curveFlag!=0.0f;
++    const bool observe=probeObserved_&&curveFlag!=0.0f&&!predictionSurface;
+     const bool sameScope=probeCurve_==hdrCurve&&probeIdentity_.epoch==identity.epoch&&probeIdentity_.settingsRevision==identity.settingsRevision;
+     if(!observe||!sameScope)liveCoverage_={};
+     if(probePending_&&pipeline::fenceComplete(fence,probeFenceValue_))publishLiveCoverage(hdrCurve,identity);
+@@ -373,9 +420,9 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     // COMMON, and the consumer fence signalled after this list covers the read.
+     bool captureRecorded=false;
+     struct CaptureGuard{PresentCapture* capture;bool& recorded;~CaptureGuard(){if(recorded&&capture)capture->discarded();}} captureGuard{capture_,captureRecorded};
+-    if(capture_){
++    if(capture_&&!predictionRefresh){
+         const uint32_t hdrMode=graph.hdrOutput()?(graph.hdr10Output()?2u:1u):0u;
+-        captureRecorded=capture_->record(list,{source,graph.outputFormat(),graph.workWidth(),graph.workHeight(),hdrMode,graph.outputDitherStep(),generated});
++        captureRecorded=capture_->record(list,{graphSource,graph.outputFormat(),graph.workWidth(),graph.workHeight(),hdrMode,graph.outputDitherStep(),generated});
+     }
+     // Interpolation region for the XeSS present-sink FG backend.
+     // It must follow the PresentBlit view mapping (contain * zoom, view
+@@ -505,6 +552,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing&
+     if(presentationQueue_)graph.presentationSubmitted(slot,fence,ring.lastSignaledValue());
+     const auto dxgiStart=std::chrono::steady_clock::now();
+     lastPresentCallHost100ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(dxgiStart.time_since_epoch()).count()/100;
++    if(prediction_)prediction_->presented(lastPresentCallHost100ns_);
+     antiLag_.present(generated);
+     reflex_.presentStart(reflexFrame,generated);
+     const bool presented=sink_.present(st);
+@@ -578,6 +626,7 @@ void VideoPresenter::close(){
+     antiLag_.close();
+     reflex_.close();reflexFrame_=reflexInputFrame_=0;
+     if(presentationRing_.initialized())presentationRing_.drainQueue();
++    prediction_.reset();predictionSource_={};predictionUnavailable_=false;predictionCostEnd_=0;predictionSettings_={};
+     hasPresented_=false;gpuTimer_.close();compositeTarget_.Reset();exclusionUiTarget_.Reset();exclusionHudlessTarget_.Reset();exclusionUiEnabled_=false;copyBeforePresent_=copyEligible_=false;rtvs_.Reset();
+     probeStats_.Reset();probeReadback_.Reset();probeCpuViews_.Reset();probePass_={};probePending_=false;probeFailed_=false;probeNext_={};probeCurve_={};probeIdentity_={};liveCoverage_={};pass_={};sink_.shutdown();
+     presentMotionPass_={};presentMotion_={};previousXessWidth_=previousXessHeight_=0;
+@@ -627,6 +676,13 @@ double VideoPresenter::displayRefreshHz(){
+     return refreshHz_;
+ }
+ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceContext& ctx,PresentationSettings requested,bool fg,std::wstring& status,bool liveSource){
++    requested.capturePrediction=requested.capturePrediction&&liveSource&&!fg&&!xessActive();
++    if(requested.capturePrediction){
++        requested.enabled=true;requested.display=DisplaySync::Tearing;requested.variableRefresh=false;
++        requested.outputRate=OutputRateMode::Off;requested.amdAntiLag=false;requested.nvidiaLowLatency=NvidiaLowLatency::Off;
++    }
++    if(predictionSettings_.capturePrediction!=requested.capturePrediction)predictionSource_={};
++    predictionSettings_=requested;if(prediction_)prediction_->configure(requested);
+     // The NVIDIA choice only runs on an NVIDIA adapter, where it implies the
+     // low queue. Another adapter keeps the plain switch's value; the UI retains
+     // the choice for the next NVIDIA session (syncNvidiaLowLatencyQueue).
+diff --git a/src/gfx/CommandSlotRing.cpp b/src/gfx/CommandSlotRing.cpp
+index 8e4a2e1..1c3d5c6 100644
+--- a/src/gfx/CommandSlotRing.cpp
++++ b/src/gfx/CommandSlotRing.cpp
+@@ -7,6 +7,11 @@
+ #include "veyra/NgxResult.h"
+ 
+ namespace veyra::gfx {
++bool CommandSlotRing::nextSlotReady() const {
++    if(!initialized_||!slotCount_||!fence_)return false;
++    const auto done=fence_->GetCompletedValue();
++    return done!=UINT64_MAX&&done>=slots_[nextSlot_%slotCount_].fenceValue;
++}
+ 
+ CommandSlotRing::~CommandSlotRing()
+ {
+diff --git a/src/ui/QmlPlayerBridge.cpp b/src/ui/QmlPlayerBridge.cpp
+index 259d216..3ce1dea 100644
+--- a/src/ui/QmlPlayerBridge.cpp
++++ b/src/ui/QmlPlayerBridge.cpp
+@@ -330,6 +330,12 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
+             pr.enabled = saved.value(QStringLiteral("lowQueue")).toBool();
+             pr.amdAntiLag = saved.value(QStringLiteral("amdAntiLag"),false).toBool();
+             pr.xessResponsiveFallback = saved.value(QStringLiteral("xessResponsiveFallback"),false).toBool();
++            pr.capturePrediction=saved.value(QStringLiteral("capturePrediction"),false).toBool();
++            const auto finiteRange=[&](const char* key,double fallback,double low,double high){const double value=saved.value(QLatin1String(key),fallback).toDouble();return std::isfinite(value)?std::clamp(value,low,high):fallback;};
++            pr.predictionLeadMs=finiteRange("predictionLeadMs",8,0,30);
++            pr.predictionRefreshHz=finiteRange("predictionRefreshHz",120,30,240);
++            pr.predictionMaxHorizonMs=finiteRange("predictionMaxHorizonMs",33,1,50);
++            pr.predictionProtectHud=saved.value(QStringLiteral("predictionProtectHud"),true).toBool();
+             // Before NVIDIA-specific choices, the low queue meant On on NVIDIA.
+             const int savedLatency=saved.value(QStringLiteral("nvidiaLowLatency"),pr.enabled&&nvidiaLowLatencyAvailable()?1:0).toInt();
+             pr.nvidiaLowLatency=engine::savedNvidiaLowLatency(savedLatency);
+diff --git a/src/ui/bridge/Capture.cpp b/src/ui/bridge/Capture.cpp
+index d54076e..569168b 100644
+--- a/src/ui/bridge/Capture.cpp
++++ b/src/ui/bridge/Capture.cpp
+@@ -250,6 +250,7 @@ void QmlPlayerBridge::setCaptureAudioIngress(int value) {
+ }
+ int QmlPlayerBridge::captureBufferMode() const { return int(settings().captureBuffer); }
+ void QmlPlayerBridge::setCaptureBufferMode(int value) {
++    if(capturePrediction())value=1;
+     if (value < 0 || value > 2) return;
+     auto s = settings(); s.captureBuffer = static_cast<source::CaptureBufferMode>(value);
+     if(impl_->commit(std::move(s))){impl_->prefs["captureBufferMode"]=value;if(!impl_->savePrefs())emit notice(tr("采集设置保存失败，请检查配置目录是否可写"),true);}
+diff --git a/src/ui/bridge/Chain.cpp b/src/ui/bridge/Chain.cpp
+index 820882b..47231b1 100644
+--- a/src/ui/bridge/Chain.cpp
++++ b/src/ui/bridge/Chain.cpp
+@@ -685,6 +685,7 @@ int QmlPlayerBridge::duplicateNrLayer(int index){
+ bool QmlPlayerBridge::removeEffect(int index) {
+     auto& c = impl_->chain;
+     if (index < 0 || uint32_t(index) >= c.nodeCount) return false;
++    if(enabled&&c.nodes[index].type==engine::EffectType::FrameGeneration&&capturePrediction())setCapturePrediction(false);
+     const auto& info = engine::effectInfo(c.nodes[index].type);
+     if (info.mustBeLast) { emit notice(tr("补帧固定为最后一步，不能删除"), true); return false; }
+     const auto before=c; const int selected=impl_->selectedNr,colourSelected=impl_->selectedColour;
+diff --git a/src/ui/bridge/Enhancement.cpp b/src/ui/bridge/Enhancement.cpp
+index b4e6e0b..4e793a2 100644
+--- a/src/ui/bridge/Enhancement.cpp
++++ b/src/ui/bridge/Enhancement.cpp
+@@ -1126,6 +1126,7 @@ void QmlPlayerBridge::setFgMultiplier(int multiplier) {
+     auto* node = chain.firstOf(engine::EffectType::FrameGeneration);
+     if (!node) { if (multiplier > 1) emit notice(tr("请先添加补帧节点"), true); return; }
+     const bool enabled = multiplier > 1;
++    if(enabled&&capturePrediction())setCapturePrediction(false);
+     if (node->enabled == enabled && (!enabled || chain.fgMultiplier == uint32_t(multiplier))) return;
+     const auto beforeMultiplier = chain.fgMultiplier; const auto beforeEnabled = node->enabled;
+     node->enabled = enabled; if (enabled) chain.fgMultiplier = uint32_t(multiplier);
+diff --git a/src/ui/bridge/FrameGeneration.cpp b/src/ui/bridge/FrameGeneration.cpp
+index 28b9ca0..2a1c8f7 100644
+--- a/src/ui/bridge/FrameGeneration.cpp
++++ b/src/ui/bridge/FrameGeneration.cpp
+@@ -184,6 +184,26 @@ void QmlPlayerBridge::setAmdAntiLag(bool value){
+     impl_->presentation.amdAntiLag=value;applyPresentation();
+ }
+ bool QmlPlayerBridge::xessResponsiveFallback()const{return impl_->presentation.xessResponsiveFallback;}
++bool QmlPlayerBridge::capturePrediction()const{return impl_->presentation.capturePrediction;}
++void QmlPlayerBridge::setCapturePrediction(bool value){
++    if(impl_->presentation.capturePrediction==value)return;
++    if(value){
++        const auto previous=impl_->chain;
++        for(unsigned i=0;i<impl_->chain.nodeCount;++i)if(impl_->chain.nodes[i].type==engine::EffectType::FrameGeneration)impl_->chain.nodes[i].enabled=false;
++        if(!impl_->revalidate(true)){impl_->chain=previous;impl_->revalidate();emit settingsChanged();return;}
++        setCaptureBufferMode(1); // minimum device allocator, applied on next connect
++        emitChainChanged();
++    }
++    impl_->presentation.capturePrediction=value;applyPresentation();
++}
++double QmlPlayerBridge::predictionLeadMs()const{return impl_->presentation.predictionLeadMs;}
++void QmlPlayerBridge::setPredictionLeadMs(double value){if(!std::isfinite(value)||value<0||value>30)return;impl_->presentation.predictionLeadMs=value;applyPresentation();}
++double QmlPlayerBridge::predictionRefreshHz()const{return impl_->presentation.predictionRefreshHz;}
++void QmlPlayerBridge::setPredictionRefreshHz(double value){if(!std::isfinite(value)||value<30||value>240)return;impl_->presentation.predictionRefreshHz=value;applyPresentation();}
++double QmlPlayerBridge::predictionMaxHorizonMs()const{return impl_->presentation.predictionMaxHorizonMs;}
++void QmlPlayerBridge::setPredictionMaxHorizonMs(double value){if(!std::isfinite(value)||value<1||value>50)return;impl_->presentation.predictionMaxHorizonMs=value;applyPresentation();}
++bool QmlPlayerBridge::predictionProtectHud()const{return impl_->presentation.predictionProtectHud;}
++void QmlPlayerBridge::setPredictionProtectHud(bool value){impl_->presentation.predictionProtectHud=value;applyPresentation();}
+ void QmlPlayerBridge::setXessResponsiveFallback(bool value){
+     if(impl_->presentation.xessResponsiveFallback==value)return;
+     impl_->presentation.xessResponsiveFallback=value;applyPresentation();
+@@ -381,7 +401,10 @@ void QmlPlayerBridge::applyPresentation() {
+     if (!p.valid()) return;
+     impl_->engine.requestPresentation(p);
+     impl_->prefs[QStringLiteral("presentation")] = QVariantMap{
+-        {"lowQueue", p.enabled}, {"amdAntiLag",p.amdAntiLag}, {"xessResponsiveFallback",p.xessResponsiveFallback}, {"nvidiaLowLatency",int(p.nvidiaLowLatency)}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}, {"vrr", p.variableRefresh}};
++        {"lowQueue", p.enabled}, {"amdAntiLag",p.amdAntiLag}, {"xessResponsiveFallback",p.xessResponsiveFallback},
++        {"capturePrediction",p.capturePrediction},{"predictionLeadMs",p.predictionLeadMs},{"predictionRefreshHz",p.predictionRefreshHz},
++        {"predictionMaxHorizonMs",p.predictionMaxHorizonMs},{"predictionProtectHud",p.predictionProtectHud},
++        {"nvidiaLowLatency",int(p.nvidiaLowLatency)}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}, {"vrr", p.variableRefresh}};
+     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "presentation settings not saved");
+     veyra::log::info("ui-presentation", std::format("lowQueue={} nvidiaLowLatency={} display={} outputRate={} customFps={:.3f} variableRefresh={}",
+         p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
+diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
+index fda708a..43df0d5 100644
+--- a/tests/integration/CapturePredictionGpuTests.cpp
++++ b/tests/integration/CapturePredictionGpuTests.cpp
+@@ -112,6 +112,7 @@ struct Test {
+     }
+ };
+ }
++#ifndef VEYRA_PREDICTION_GPU_TEST_HELPERS
+ int main() try {
+     Test t;unsigned checks=0;
+     auto check=[&](bool ok,const char* what){++checks;require(ok,what);};
+@@ -162,3 +163,4 @@ int main() try {
+         <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
+     return 0;
+ } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
++#endif
+diff --git a/tests/integration/CapturePredictionSessionTests.cpp b/tests/integration/CapturePredictionSessionTests.cpp
+new file mode 100644
+index 0000000..f03c1df
+--- /dev/null
++++ b/tests/integration/CapturePredictionSessionTests.cpp
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#define VEYRA_PREDICTION_GPU_TEST_HELPERS
++#include "CapturePredictionGpuTests.cpp"
++#include "veyra/engine/CapturePredictionSession.h"
++using namespace veyra::engine;
++int main() try {
++    Test t;CapturePredictionSession session;
++    ComPtr<ID3D12Resource> source[2];
++    for(auto& r:source)r=makeTexture(t.device.Get(),W,H,DXGI_FORMAT_R8G8B8A8_UNORM,false);
++    require(session.initialize(t.device.Get(),source[0].Get(),source[1].Get()),"initialize integrated GPU DIS prediction session");
++    PresentationSettings settings;settings.capturePrediction=true;settings.predictionProtectHud=false;
++    session.configure(settings);
++    unsigned forecasts=0;double error=0,holdError=0;
++    auto decode=[](float v){return v<=.04045f?v/12.92f:std::pow((v+.055f)/1.055f,2.4f);};
++    for(unsigned frame=1;frame<=10;++frame){
++        t.begin();const unsigned parity=frame%2;const float shift=float(frame*2);
++        std::vector<uint8_t> pixels(W*H*4);
++        for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){
++            const auto value=uint8_t(std::lround(pattern(float(x)-shift,float(y))*255));
++            for(unsigned c=0;c<3;++c)pixels[(y*W+x)*4+c]=value;pixels[(y*W+x)*4+3]=255;
++        }
++        t.upload(source[parity].Get(),pixels);
++        t.tracker.transition(t.list.Get(),source[parity].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        const int64_t pts=int64_t(frame-1)*333333,arrival=100000000+pts;
++        auto* forecast=session.record(t.list.Get(),t.queue.Get(),t.fence.Get(),t.value+1,parity,{1,1,frame},pts,arrival,arrival,false);
++        t.tracker.transition(t.list.Get(),source[parity].Get(),D3D12_RESOURCE_STATE_COMMON);
++        ComPtr<ID3D12Resource> readback;D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT rows;UINT64 rowBytes,total;
++        if(forecast){
++            ++forecasts;auto desc=forecast->GetDesc();t.device->GetCopyableFootprints(&desc,0,1,0,&footprint,&rows,&rowBytes,&total);
++            D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;
++            D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=total;buffer.Height=1;
++            buffer.DepthOrArraySize=buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++            hr(t.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback)),"session readback");
++            StateTracker temporary;temporary.transition(t.list.Get(),forecast,D3D12_RESOURCE_STATE_COPY_SOURCE);
++            D3D12_TEXTURE_COPY_LOCATION a{},b{};a.pResource=readback.Get();a.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;a.PlacedFootprint=footprint;
++            b.pResource=forecast;b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;t.list->CopyTextureRegion(&a,0,0,0,&b,nullptr);
++            temporary.transition(t.list.Get(),forecast,D3D12_RESOURCE_STATE_COMMON);
++        }
++        t.finish();session.presented(arrival);
++        if(forecast){
++            void* mapped;D3D12_RANGE range{0,size_t(total)};hr(readback->Map(0,&range,&mapped),"session map");
++            for(unsigned y=12;y<H-12;++y)for(unsigned x=16;x<W-16;++x){
++                const auto* pixel=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped)+y*footprint.Footprint.RowPitch)+x*4;
++                const double future=decode(pattern(float(x)-shift-2.f*8.f/(1000.f/30),float(y)));
++                error+=std::abs(XMConvertHalfToFloat(pixel[0])-future);
++                holdError+=std::abs(decode(pixels[(y*W+x)*4]/255.f)-future);
++                require(std::isfinite(XMConvertHalfToFloat(pixel[0])),"finite estimated-motion output");
++            }
++            D3D12_RANGE empty{0,0};readback->Unmap(0,&empty);
++        }
++        require(!session.due(arrival+1000),"no refresh before output deadline");
++    }
++    require(forecasts>=8,"real estimated-motion warmup produces forecasts");
++    std::cout<<"Estimated-motion session error "<<holdError<<" -> "<<error<<" forecasts="<<forecasts<<'\n';
++    require(error<holdError*.98,"estimated optical flow must improve prediction against future truth");
++    session.reset();require(!session.due(200000000),"reset clears refresh ownership");
++    t.checkDebug();std::cout<<"GPU DIS + capture prediction integration PASS (WARP, not Radeon performance)\n";return 0;
++}catch(const std::exception& error){std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
