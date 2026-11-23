@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 866cb0e..f391b0c 100644
+index 866cb0e..cc953ba 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -348,6 +348,7 @@ veyra_add_compute_shader(veyra_shader_nr_reuse_warp NrReuseWarp)
@@ -19,18 +19,30 @@ index 866cb0e..f391b0c 100644
    add_executable(veyra_playlist_tests tests/unit/PlaylistModelTests.cpp src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h)
    set_target_properties(veyra_playlist_tests PROPERTIES AUTOMOC ON)
    target_compile_features(veyra_playlist_tests PRIVATE cxx_std_20)
-@@ -1553,6 +1556,11 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+@@ -1553,6 +1556,14 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
  
    # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
    add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
 +  target_sources(veyra_engine PRIVATE src/engine/CapturePredictionSession.cpp)
-+  add_executable(veyra_capture_prediction_session_tests tests/integration/CapturePredictionSessionTests.cpp)
-+  target_link_libraries(veyra_capture_prediction_session_tests PRIVATE veyra_engine)
++  add_executable(veyra_capture_prediction_session_tests tests/integration/CapturePredictionSessionTests.cpp
++    src/engine/CapturePredictionSession.cpp src/guidance/GpuDisOpticalFlow.cpp
++    third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
++  target_include_directories(veyra_capture_prediction_session_tests PRIVATE third_party/gpu-dis/src/gpu)
++  target_link_libraries(veyra_capture_prediction_session_tests PRIVATE veyra_capture_prediction dxguid)
 +  target_link_libraries(veyra_engine PUBLIC veyra_capture_prediction)
 +  add_dependencies(veyra_engine veyra_shader_capture_prediction_ingress)
    target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
      src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
    target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
+@@ -1560,6 +1571,8 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+   veyra_add_compute_shader(veyra_shader_gpu_dis_luma GpuDisLuma)
+   veyra_add_compute_shader(veyra_shader_gpu_dis_validate GpuDisValidate)
+   add_dependencies(veyra_pipeline veyra_shader_gpu_dis veyra_shader_gpu_dis_luma veyra_shader_gpu_dis_validate)
++  add_dependencies(veyra_capture_prediction_session_tests veyra_shader_capture_prediction_ingress
++    veyra_shader_gpu_dis veyra_shader_gpu_dis_luma veyra_shader_gpu_dis_validate)
+   if(EXISTS "${VEYRA_FIDELITYFX_ROOT}/bin/ffx_sdk/ffx_opticalflow_x64.lib")
+     target_compile_definitions(veyra_pipeline PRIVATE VEYRA_HAS_AMD_OF=1)
+     target_include_directories(veyra_pipeline PRIVATE "${VEYRA_FIDELITYFX_ROOT}/include")
 diff --git a/include/veyra/engine/CapturePredictionSession.h b/include/veyra/engine/CapturePredictionSession.h
 new file mode 100644
 index 0000000..9499108
@@ -886,10 +898,33 @@ index 28b9ca0..12efbe8 100644
          p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
      emit presentationChanged();
 diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
-index fda708a..98b8c5c 100644
+index fda708a..8c9c7aa 100644
 --- a/tests/integration/CapturePredictionGpuTests.cpp
 +++ b/tests/integration/CapturePredictionGpuTests.cpp
-@@ -57,6 +57,7 @@ struct Test {
+@@ -15,7 +15,7 @@ using DirectX::PackedVector::XMConvertFloatToHalf;
+ using DirectX::PackedVector::XMConvertHalfToFloat;
+ namespace {
+ void require(bool ok,const char* what) { if(!ok)throw std::runtime_error(what); }
+-void hr(HRESULT value,const char* what) { require(SUCCEEDED(value),what); }
++void hr(HRESULT value,const char* what) { if(FAILED(value)){std::cerr<<what<<" HRESULT=0x"<<std::hex<<unsigned(value)<<std::dec<<std::endl;require(false,what);} }
+ constexpr unsigned W=128,H=72,FW=64,FH=36;
+ float pattern(float x,float y) {
+     return .35f+.12f*std::sin(x*.17f)+.08f*std::cos(y*.21f)+.05f*std::sin((x+y)*.31f);
+@@ -32,7 +32,12 @@ struct Test {
+     CapturePredictionPass pass;
+     Test() {
+         ComPtr<ID3D12Debug> layer;
+-        if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer))))layer->EnableDebugLayer();
++        if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))){
++            layer->EnableDebugLayer();
++#ifdef VEYRA_PREDICTION_GPU_TEST_HELPERS
++            ComPtr<ID3D12Debug1> validation;if(SUCCEEDED(layer.As(&validation)))validation->SetEnableGPUBasedValidation(TRUE);
++#endif
++        }
+         ComPtr<IDXGIFactory4> factory;hr(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)),"DXGI factory");
+         ComPtr<IDXGIAdapter> warp;hr(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"WARP adapter");
+         hr(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"D3D12 WARP device");
+@@ -57,6 +62,7 @@ struct Test {
          hr(list->Close(),"close list");ID3D12CommandList* work[]={list.Get()};queue->ExecuteCommandLists(1,work);
          hr(queue->Signal(fence.Get(),++value),"signal");hr(fence->SetEventOnCompletion(value,event),"set event");
          require(WaitForSingleObject(event,30000)==WAIT_OBJECT_0,"bounded diagnostic wait");
@@ -897,7 +932,7 @@ index fda708a..98b8c5c 100644
          hr(device->GetDeviceRemovedReason(),"device health");
      }
      void upload(ID3D12Resource* texture,const std::vector<uint8_t>& bytes) {
-@@ -112,6 +113,7 @@ struct Test {
+@@ -112,6 +118,7 @@ struct Test {
      }
  };
  }
@@ -905,17 +940,17 @@ index fda708a..98b8c5c 100644
  int main() try {
      Test t;unsigned checks=0;
      auto check=[&](bool ok,const char* what){++checks;require(ok,what);};
-@@ -162,3 +164,4 @@ int main() try {
+@@ -162,3 +169,4 @@ int main() try {
          <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
      return 0;
  } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
 +#endif
 diff --git a/tests/integration/CapturePredictionSessionTests.cpp b/tests/integration/CapturePredictionSessionTests.cpp
 new file mode 100644
-index 0000000..5c5a04f
+index 0000000..0d8ed7c
 --- /dev/null
 +++ b/tests/integration/CapturePredictionSessionTests.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#define VEYRA_PREDICTION_GPU_TEST_HELPERS
 +#include "CapturePredictionGpuTests.cpp"
@@ -954,6 +989,7 @@ index 0000000..5c5a04f
 +            b.pResource=forecast;b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;t.list->CopyTextureRegion(&a,0,0,0,&b,nullptr);
 +            temporary.transition(t.list.Get(),forecast,D3D12_RESOURCE_STATE_COMMON);
 +        }
++        std::cout<<"Submit estimated-motion source "<<frame<<" forecast="<<(forecast!=nullptr)<<std::endl;
 +        t.finish();session.presented(arrival);
 +        if(forecast){
 +            void* mapped;D3D12_RANGE range{0,size_t(total)};hr(readback->Map(0,&range,&mapped),"session map");
