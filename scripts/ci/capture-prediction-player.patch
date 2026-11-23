@@ -898,7 +898,7 @@ index 28b9ca0..12efbe8 100644
          p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
      emit presentationChanged();
 diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
-index fda708a..8c9c7aa 100644
+index fda708a..f8bca75 100644
 --- a/tests/integration/CapturePredictionGpuTests.cpp
 +++ b/tests/integration/CapturePredictionGpuTests.cpp
 @@ -15,7 +15,7 @@ using DirectX::PackedVector::XMConvertFloatToHalf;
@@ -910,7 +910,7 @@ index fda708a..8c9c7aa 100644
  constexpr unsigned W=128,H=72,FW=64,FH=36;
  float pattern(float x,float y) {
      return .35f+.12f*std::sin(x*.17f)+.08f*std::cos(y*.21f)+.05f*std::sin((x+y)*.31f);
-@@ -32,7 +32,12 @@ struct Test {
+@@ -32,7 +32,19 @@ struct Test {
      CapturePredictionPass pass;
      Test() {
          ComPtr<ID3D12Debug> layer;
@@ -921,18 +921,37 @@ index fda708a..8c9c7aa 100644
 +            ComPtr<ID3D12Debug1> validation;if(SUCCEEDED(layer.As(&validation)))validation->SetEnableGPUBasedValidation(TRUE);
 +#endif
 +        }
++        #ifdef VEYRA_PREDICTION_GPU_TEST_HELPERS
++        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
++        if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))){
++            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
++            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
++        }
++#endif
          ComPtr<IDXGIFactory4> factory;hr(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)),"DXGI factory");
          ComPtr<IDXGIAdapter> warp;hr(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"WARP adapter");
          hr(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"D3D12 WARP device");
-@@ -57,6 +62,7 @@ struct Test {
+@@ -57,6 +69,19 @@ struct Test {
          hr(list->Close(),"close list");ID3D12CommandList* work[]={list.Get()};queue->ExecuteCommandLists(1,work);
          hr(queue->Signal(fence.Get(),++value),"signal");hr(fence->SetEventOnCompletion(value,event),"set event");
          require(WaitForSingleObject(event,30000)==WAIT_OBJECT_0,"bounded diagnostic wait");
-+        if(FAILED(device->GetDeviceRemovedReason()))checkDebug();
++        if(FAILED(device->GetDeviceRemovedReason())){
++            checkDebug();
++            ComPtr<ID3D12DeviceRemovedExtendedData> dred;
++            if(SUCCEEDED(device.As(&dred))){
++                D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
++                if(SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs)))for(auto* n=breadcrumbs.pHeadAutoBreadcrumbNode;n;n=n->pNext){
++                    const auto last=n->pLastBreadcrumbValue?*n->pLastBreadcrumbValue:0;
++                    std::cerr<<"DRED list "<<(n->pCommandListDebugNameA?n->pCommandListDebugNameA:"unnamed")<<" progress="<<last<<"/"<<n->BreadcrumbCount<<std::endl;
++                    for(UINT k=last>8?last-8:0;k<std::min(last+3,n->BreadcrumbCount);++k)std::cerr<<"DRED op "<<k<<"="<<unsigned(n->pCommandHistory[k])<<std::endl;
++                }
++                D3D12_DRED_PAGE_FAULT_OUTPUT fault{};if(SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)))std::cerr<<"DRED page fault VA="<<fault.PageFaultVA<<std::endl;
++            }
++        }
          hr(device->GetDeviceRemovedReason(),"device health");
      }
      void upload(ID3D12Resource* texture,const std::vector<uint8_t>& bytes) {
-@@ -112,6 +118,7 @@ struct Test {
+@@ -112,6 +137,7 @@ struct Test {
      }
  };
  }
@@ -940,28 +959,29 @@ index fda708a..8c9c7aa 100644
  int main() try {
      Test t;unsigned checks=0;
      auto check=[&](bool ok,const char* what){++checks;require(ok,what);};
-@@ -162,3 +169,4 @@ int main() try {
+@@ -162,3 +188,4 @@ int main() try {
          <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
      return 0;
  } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
 +#endif
 diff --git a/tests/integration/CapturePredictionSessionTests.cpp b/tests/integration/CapturePredictionSessionTests.cpp
 new file mode 100644
-index 0000000..0d8ed7c
+index 0000000..cd01ed3
 --- /dev/null
 +++ b/tests/integration/CapturePredictionSessionTests.cpp
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,70 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#define VEYRA_PREDICTION_GPU_TEST_HELPERS
 +#include "CapturePredictionGpuTests.cpp"
 +#include "veyra/engine/CapturePredictionSession.h"
 +using namespace veyra::engine;
-+int main() try {
++int main(int argc,char**) try {
++    const bool copyOnly=argc>1;
 +    Test t;CapturePredictionSession session;
 +    ComPtr<ID3D12Resource> source[2];
 +    for(auto& r:source)r=makeTexture(t.device.Get(),W,H,DXGI_FORMAT_R8G8B8A8_UNORM,false);
 +    require(session.initialize(t.device.Get(),source[0].Get(),source[1].Get()),"initialize integrated GPU DIS prediction session");
-+    PresentationSettings settings;settings.capturePrediction=true;settings.predictionProtectHud=false;
++    PresentationSettings settings;settings.capturePrediction=true;settings.predictionProtectHud=false;if(copyOnly)settings.predictionLeadMs=0;
 +    session.configure(settings);
 +    unsigned forecasts=0;double error=0,holdError=0;
 +    auto decode=[](float v){return v<=.04045f?v/12.92f:std::pow((v+.055f)/1.055f,2.4f);};
@@ -991,6 +1011,7 @@ index 0000000..0d8ed7c
 +        }
 +        std::cout<<"Submit estimated-motion source "<<frame<<" forecast="<<(forecast!=nullptr)<<std::endl;
 +        t.finish();session.presented(arrival);
++        if(copyOnly&&frame==2){t.checkDebug();std::cout<<"Ingress + DIS + zero-horizon copy PASS"<<std::endl;return 0;}
 +        if(forecast){
 +            void* mapped;D3D12_RANGE range{0,size_t(total)};hr(readback->Map(0,&range,&mapped),"session map");
 +            for(unsigned y=12;y<H-12;++y)for(unsigned x=16;x<W-16;++x){

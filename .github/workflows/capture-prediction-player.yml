@@ -53,6 +53,7 @@ jobs:
           $env:PATH = "$pwd/out/capture-ci/donor/Veyra-2.1.9-AMD-win64-portable;$env:PATH"
           out/capture-ci/build/veyra_capture_prediction_tests.exe
           out/capture-ci/build/veyra_capture_prediction_gpu_tests.exe
+          out/capture-ci/build/veyra_capture_prediction_session_tests.exe --copy-only
           out/capture-ci/build/veyra_capture_prediction_session_tests.exe
           python -B scripts/i18n/extract.py --check
       - name: Build the complete player and control tests
