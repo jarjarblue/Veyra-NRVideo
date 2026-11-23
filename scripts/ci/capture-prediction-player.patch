@@ -44,6 +44,23 @@ index 866cb0e..610fce3 100644
    if(EXISTS "${VEYRA_FIDELITYFX_ROOT}/bin/ffx_sdk/ffx_opticalflow_x64.lib")
      target_compile_definitions(veyra_pipeline PRIVATE VEYRA_HAS_AMD_OF=1)
      target_include_directories(veyra_pipeline PRIVATE "${VEYRA_FIDELITYFX_ROOT}/include")
+diff --git a/cmake/VeyraGpuDis.cmake b/cmake/VeyraGpuDis.cmake
+index fe28bc5..0f28d37 100644
+--- a/cmake/VeyraGpuDis.cmake
++++ b/cmake/VeyraGpuDis.cmake
+@@ -134,3 +134,12 @@ add_custom_command(
+  VERBATIM)
+ list(APPEND dis_outputs "${CMAKE_CURRENT_BINARY_DIR}/shaders/dis/dis_perfect_final.dxil")
+ add_custom_target(veyra_shader_gpu_dis DEPENDS ${dis_outputs})
++
++add_custom_command(
++ OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/shaders/dis/dis_integer_area.dxil"
++ COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders/dis"
++ COMMAND "${DIS_DXC}" -nologo -T cs_6_0 -E main -Fo "${CMAKE_CURRENT_BINARY_DIR}/shaders/dis/dis_integer_area.dxil" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gpu-dis/src/gpu/shaders/dis_integer_area.hlsl"
++ DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gpu-dis/src/gpu/shaders/dis_integer_area.hlsl"
++ VERBATIM)
++add_custom_target(veyra_shader_gpu_dis_integer_area DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/shaders/dis/dis_integer_area.dxil")
++add_dependencies(veyra_shader_gpu_dis veyra_shader_gpu_dis_integer_area)
 diff --git a/include/veyra/engine/CapturePredictionSession.h b/include/veyra/engine/CapturePredictionSession.h
 new file mode 100644
 index 0000000..9499108
@@ -927,10 +944,18 @@ index 28b9ca0..12efbe8 100644
          p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
      emit presentationChanged();
 diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
-index fda708a..f8bca75 100644
+index fda708a..ec9a979 100644
 --- a/tests/integration/CapturePredictionGpuTests.cpp
 +++ b/tests/integration/CapturePredictionGpuTests.cpp
-@@ -15,7 +15,7 @@ using DirectX::PackedVector::XMConvertFloatToHalf;
+@@ -6,6 +6,7 @@
+ #include <dxgi1_6.h>
+ #include <d3d12sdklayers.h>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <limits>
+@@ -15,7 +16,7 @@ using DirectX::PackedVector::XMConvertFloatToHalf;
  using DirectX::PackedVector::XMConvertHalfToFloat;
  namespace {
  void require(bool ok,const char* what) { if(!ok)throw std::runtime_error(what); }
@@ -939,7 +964,7 @@ index fda708a..f8bca75 100644
  constexpr unsigned W=128,H=72,FW=64,FH=36;
  float pattern(float x,float y) {
      return .35f+.12f*std::sin(x*.17f)+.08f*std::cos(y*.21f)+.05f*std::sin((x+y)*.31f);
-@@ -32,7 +32,19 @@ struct Test {
+@@ -32,7 +33,19 @@ struct Test {
      CapturePredictionPass pass;
      Test() {
          ComPtr<ID3D12Debug> layer;
@@ -960,7 +985,7 @@ index fda708a..f8bca75 100644
          ComPtr<IDXGIFactory4> factory;hr(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)),"DXGI factory");
          ComPtr<IDXGIAdapter> warp;hr(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"WARP adapter");
          hr(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"D3D12 WARP device");
-@@ -57,6 +69,19 @@ struct Test {
+@@ -57,6 +70,21 @@ struct Test {
          hr(list->Close(),"close list");ID3D12CommandList* work[]={list.Get()};queue->ExecuteCommandLists(1,work);
          hr(queue->Signal(fence.Get(),++value),"signal");hr(fence->SetEventOnCompletion(value,event),"set event");
          require(WaitForSingleObject(event,30000)==WAIT_OBJECT_0,"bounded diagnostic wait");
@@ -976,11 +1001,13 @@ index fda708a..f8bca75 100644
 +                }
 +                D3D12_DRED_PAGE_FAULT_OUTPUT fault{};if(SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)))std::cerr<<"DRED page fault VA="<<fault.PageFaultVA<<std::endl;
 +            }
++            std::cerr<<"Fatal diagnostic device loss HRESULT=0x"<<std::hex<<unsigned(device->GetDeviceRemovedReason())<<std::dec<<std::endl;
++            std::cout.flush();std::cerr.flush();std::_Exit(1); // Avoid hanging in a removed software driver's teardown.
 +        }
          hr(device->GetDeviceRemovedReason(),"device health");
      }
      void upload(ID3D12Resource* texture,const std::vector<uint8_t>& bytes) {
-@@ -112,6 +137,7 @@ struct Test {
+@@ -112,6 +140,7 @@ struct Test {
      }
  };
  }
@@ -988,7 +1015,7 @@ index fda708a..f8bca75 100644
  int main() try {
      Test t;unsigned checks=0;
      auto check=[&](bool ok,const char* what){++checks;require(ok,what);};
-@@ -162,3 +188,4 @@ int main() try {
+@@ -162,3 +191,4 @@ int main() try {
          <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
      return 0;
  } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
@@ -1190,7 +1217,7 @@ index 0000000..f10ad1d
 +    }
 +}
 diff --git a/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp b/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
-index 2e37723..b32ca63 100644
+index 2e37723..da06fd2 100644
 --- a/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
 +++ b/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
 @@ -18,6 +18,9 @@
@@ -1221,7 +1248,14 @@ index 2e37723..b32ca63 100644
          D3D12_DESCRIPTOR_RANGE ranges[2]{};
          ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors=s;
          ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors=u;
-@@ -146,6 +155,9 @@ class StrictDis final : public MotionProvider {
+@@ -140,12 +149,15 @@ class StrictDis final : public MotionProvider {
+     StrictDisInput input_profile_;
+     uint32_t stride_=4,gd_inner_=8;
+     uint32_t finest_=2,coarsest_=0;
+-    Pipeline luma_,rgba_gray_,area_,gradient_,hor_,ver_,patch_,dense_,up_,v1_,v2_,system_,sor_,update_,zero_,final_;
++    Pipeline luma_,rgba_gray_,area_,integer_area_,gradient_,hor_,ver_,patch_,dense_,up_,v1_,v2_,system_,sor_,update_,zero_,final_;
+     std::vector<Slot> slots_;
+     uint64_t shader_dispatches_=0;
      void dispatch(ID3D12GraphicsCommandList* list,const Pipeline& p,const Binding& b,
                    const void* constants,uint32_t x,uint32_t y=1) {
          b.bind(list,p,constants); list->Dispatch(x,y,1); ++shader_dispatches_;
@@ -1231,3 +1265,69 @@ index 2e37723..b32ca63 100644
      }
      void allocate(Slot& s);
      void record_image(Slot& s,uint32_t index,const FrameLease& frame,ID3D12GraphicsCommandList* list);
+@@ -184,6 +196,7 @@ bool StrictDis::initialize(ID3D12Device* device,const ProviderConfig& config,std
+         }
+         else pipe(luma_,"dis_native_luma",1,1,4);
+         pipe(area_,"dis_perfect_area",1,1,4);
++        pipe(integer_area_,"dis_integer_area",1,1,4);
+         pipe(gradient_,"dis_d2_gradient",1,1,4);
+         pipe(hor_,stride_==3?"dis_d3_structure_hor_stride3":"dis_d3_structure_hor",1,5,4);
+         pipe(ver_,stride_==3?"dis_d3_structure_ver_stride3":"dis_d3_structure_ver",5,5,4);
+@@ -234,7 +247,11 @@ void StrictDis::allocate(Slot& s) {
+         for(uint32_t l=finest_;l<=coarsest_;++l) {
+             auto& i=s.image[d][l]; auto& j=s.image[1-d][l]; auto& w=s.work[l];
+             auto& t=i.tensors; auto& a=i.aux;
+-            if(l) bind(i.area,area_,{&s.image[d][l==finest_?0:l-1].image},{&i.image});
++            if(l) {
++                auto& from=s.image[d][l==finest_?0:l-1].image;
++                const bool integer=from.w%i.image.w==0&&from.h%i.image.h==0;
++                bind(i.area,integer?integer_area_:area_,{&from},{&i.image});
++            }
+             bind(i.grad,gradient_,{&i.image},{&i.gradient});
+             bind(i.hor,hor_,{&i.gradient},{&a[0],&a[1],&a[2],&a[3],&a[4]});
+             bind(i.ver,ver_,{&a[0],&a[1],&a[2],&a[3],&a[4]},{&t[0],&t[1],&t[2],&t[3],&t[4]});
+@@ -275,7 +292,8 @@ void StrictDis::record_image(Slot& s,uint32_t index,const FrameLease& frame,ID3D
+         if(l) {
+             const auto& from=levels[l==finest_?0:l-1].image;
+             const uint32_t dims[4]={from.w,from.h,w,h};
+-            i.image.to(list,kWrite); dispatch(list,area_,i.area,dims,(w+7)/8,(h+7)/8); i.image.to(list,kRead);
++            const bool integer=from.w%w==0&&from.h%h==0;
++            i.image.to(list,kWrite); dispatch(list,integer?integer_area_:area_,i.area,dims,(w+7)/8,(h+7)/8); i.image.to(list,kRead);
+         }
+         const uint32_t dims[4]={w,h,w,h}, shape[4]={w,h,i.tensors[0].w,i.tensors[0].h};
+         i.gradient.to(list,kWrite); dispatch(list,gradient_,i.grad,dims,(w+7)/8,(h+7)/8); i.gradient.to(list,kRead);
+diff --git a/third_party/gpu-dis/src/gpu/shaders/dis_integer_area.hlsl b/third_party/gpu-dis/src/gpu/shaders/dis_integer_area.hlsl
+new file mode 100644
+index 0000000..eb1afe9
+--- /dev/null
++++ b/third_party/gpu-dis/src/gpu/shaders/dis_integer_area.hlsl
+@@ -0,0 +1,29 @@
++// Distribution note (2026-09-09): project-owned additions and modifications
++// are licensed under Apache-2.0. Upstream portions retain their original
++// licenses and attribution; see NOTICE, PROVENANCE.md and licenses/.
++// OpenCV DIS/reference-derived portions retain Intel (2000-2008), Willow
++// Garage (2009) and other upstream copyrights and BSD/Apache terms.
++// See licenses/OPENCV_DIS_BSD_HEADER.txt and OPENCV_APACHE_LICENSE.txt.
++
++// Integer pyramid ratios use exact integer accumulation and rounding without
++// compiling the generic FP64 tap-table path into this dispatch.
++Texture2D<float> Source : register(t0);
++RWTexture2D<float> Destination : register(u0);
++cbuffer Params : register(b0) { uint srcWidth; uint srcHeight; uint dstWidth; uint dstHeight; };
++[numthreads(8,8,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    if(id.x>=dstWidth||id.y>=dstHeight||dstWidth==0||dstHeight==0)return;
++    uint sx=srcWidth/dstWidth, sy=srcHeight/dstHeight;
++    if(sx==0||sy==0)return;
++    uint sum=0;
++    for(uint y=0;y<sy;++y)for(uint x=0;x<sx;++x)
++        sum+=(uint)Source.Load(int3(id.x*sx+x,id.y*sy+y,0));
++    uint area=sx*sy, value;
++    if(sx==1&&sy==1)value=sum;
++    else if(sx==2&&sy==2)value=(sum+2)>>2;
++    else {
++        uint q=sum/area, r=sum%area;
++        value=q+((r*2>area)||(r*2==area&&(q&1))?1:0);
++    }
++    Destination[id.xy]=(float)value;
++}
