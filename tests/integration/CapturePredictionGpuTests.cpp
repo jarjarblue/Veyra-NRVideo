@@ -83,10 +83,10 @@ struct Test {
         }return p;
     }
     std::vector<uint16_t> run(CapturePredictionPass::Parameters params,float shift=4,float confidence=1,
-                             bool cut=false,bool badMotion=false,bool stop=false,unsigned output=0) {
+                             bool cut=false,bool badMotion=false,bool stop=false,unsigned output=0,float oldShift=-1) {
         begin();put(in[0].Get(),colors(shift,cut));put(in[1].Get(),colors(0));
         std::vector<float> motion(FW*FH*2),old(FW*FH*2),conf(FW*FH,confidence);
-        for(unsigned i=0;i<FW*FH;++i){motion[i*2]=badMotion?std::numeric_limits<float>::quiet_NaN():(stop?0:-shift*FW/W);old[i*2]=-shift*FW/W;}
+        for(unsigned i=0;i<FW*FH;++i){motion[i*2]=badMotion?std::numeric_limits<float>::quiet_NaN():(stop?0:-shift*FW/W);old[i*2]=-(oldShift<0?shift:oldShift)*FW/W;}
         put(in[2].Get(),motion);put(in[3].Get(),old);put(in[4].Get(),conf);
         require(pass.record(list.Get(),tracker,output,params),"record forecast");
         auto d=out[output]->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows;UINT64 rowBytes,total;
@@ -127,6 +127,22 @@ int main() try {
     check(t.run(p,4,1,true)==t.colors(4,true),"scene cut is exact latest-frame passthrough");
     check(t.run(p,4,1,false,true)==latest,"NaN motion cannot poison output");
     check(t.run(p,0,1,false,false,true)==t.colors(0),"stationary picture remains exact");
+    check(t.run(p,0,1,false,false,true,0,20)==t.colors(0),"sudden stop cannot continue old velocity");
+    auto errorTo=[&](const auto& image,const auto& target) {
+        double error=0;
+        for(unsigned y=8;y<H-8;++y)for(unsigned x=16;x<W-16;++x){unsigned i=(y*W+x)*4;
+            error+=std::abs(XMConvertHalfToFloat(image[i])-XMConvertHalfToFloat(target[i]));}
+        return error;
+    };
+    auto accelerating=p;accelerating.accelerationStrength=1;
+    auto accelerationTruth=t.colors(9.75f);
+    auto accelerated=t.run(accelerating,6,1,false,false,false,0,4);
+    auto velocityOnly=accelerating;velocityOnly.accelerationStrength=0;
+    auto linear=t.run(velocityOnly,6,1,false,false,false,0,4);
+    check(errorTo(accelerated,accelerationTruth)<errorTo(linear,accelerationTruth)*.2,
+        "bounded acceleration improves independently rendered accelerating truth");
+    auto limited=p;limited.maxDisplacementPixels=1;
+    check(errorTo(t.run(limited),t.colors(5))<.001,"maximum displacement is enforced in output pixels");
     p.horizonFraction=0;check(t.run(p)==latest,"zero lead is bit-exact source");p.horizonFraction=.5f;
     p.historyValid=false;check(t.run(p)==latest,"reset never consumes stale history");p.historyValid=true;
     p.protectionFeatherPixels=0;p.protectedRegions[0]={.25f,.25f,.75f,.75f};
@@ -137,6 +153,10 @@ int main() try {
     for(unsigned y=0;y<H;++y)check(got[y*W*4]==latest[y*W*4],"exposed border falls back to source");
     auto invalid=p;invalid.horizonFraction=std::numeric_limits<float>::quiet_NaN();
     t.begin();check(!t.pass.record(t.list.Get(),t.tracker,0,invalid),"invalid parameters rejected before dispatch");t.finish();
+    t.begin();check(!t.pass.record(t.list.Get(),t.tracker,2,p),"out-of-range output slot rejected");t.finish();
+    CapturePredictionPass aliases;
+    check(!aliases.initialize(t.device.Get(),{t.in[0].Get(),t.in[1].Get(),t.in[2].Get(),t.in[3].Get(),t.in[4].Get()},
+        {t.in[0].Get()}),"input/output alias cannot be admitted");
     t.checkDebug();
     std::cout<<"Capture prediction D3D12 WARP: "<<checks<<" checks, 0 failures; synthetic known-motion MAE "
         <<originalError/pixels<<" -> "<<predictionError/pixels<<". Not hardware latency or estimated-flow quality.\n";
