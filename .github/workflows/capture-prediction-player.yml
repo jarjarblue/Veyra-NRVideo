@@ -39,7 +39,9 @@ jobs:
             out/capture-ci/deps
           key: veyra-capture-dependencies-v1
       - name: Prepare pinned original runtime and configure
-        run: python scripts/ci/prepare-capture-build.py
+        run: |
+          python scripts/ci/prepare-capture-build.py
+          cmake -S . -B out/capture-ci/build -DVEYRA_DISPLAY_VERSION=2.1.9-gpu-capture-prediction
       - name: Build the complete player and prediction tests
         timeout-minutes: 15
         run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests veyra_capture_prediction_preferences_tests veyra_qml_quick_tests
@@ -74,4 +76,10 @@ jobs:
             out/capture-ci/package.zip
             out/capture-ci/BUILD_RESULT.json
             out/capture-ci/startup-smoke.txt
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Veyra-GPU-Prediction-Compiled-Update
+          path: out/capture-ci/update.zip
           retention-days: 14

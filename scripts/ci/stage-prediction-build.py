@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -86,6 +87,22 @@ Source: scripts/ci/latency-source.patch on the fork's build branch.
         assert sha(original) == sha(PACKAGE / original.relative_to(DONOR))
     (STAGE / 'BUILD_RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
     (PACKAGE / 'BUILD_RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+    shutil.copyfile(STAGE / 'options.json', PACKAGE / 'BUILD_OPTIONS.json')
+    # Capture the actual post-patch source bytes, including new files introduced
+    # by git apply without --index. Never collect dependency/build directories.
+    source_files = set(subprocess.check_output(['git','ls-files'], cwd=ROOT, text=True).splitlines())
+    for patch_name in ('latency-source.patch','capture-prediction-cmake.patch','capture-prediction-player.patch'):
+        delta = (ROOT / 'scripts/ci' / patch_name).read_text(encoding='utf-8')
+        source_files.update(re.findall(r'^diff --git a/\S+ b/(.+)$', delta, re.MULTILINE))
+    with zipfile.ZipFile(PACKAGE / 'source-snapshot.zip','w',zipfile.ZIP_DEFLATED,compresslevel=4) as source_zip:
+        for name in sorted(source_files):
+            file = ROOT / name
+            if file.is_file(): source_zip.write(file, 'veyra-source/' + name)
+        source_zip.writestr('veyra-source/README_BUILD_SOURCE.txt',
+            'This is the actual already-patched build source. Do not apply the bundled patches again.\n'
+            'On Windows x64 with MSVC 2022, Qt 6.8.3 and Ninja, run scripts/ci/prepare-capture-build.py,\n'
+            'then cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui.\n'
+            'BUILD_OPTIONS.json and BUILD_RESULT.json record this build. Runtime dependencies are verified downloads.\n')
     # Corresponding source delta and full notices travel with the binary.
     shutil.copyfile(ROOT / 'scripts/ci/latency-source.patch', PACKAGE / 'latency-source.patch')
     for name in ('capture-prediction-cmake.patch','capture-prediction-player.patch'):
@@ -98,6 +115,24 @@ Source: scripts/ci/latency-source.patch on the fork's build branch.
         for path in PACKAGE.rglob('*'):
             if path.is_file():
                 archive.write(path, PACKAGE.name + '/' + path.relative_to(PACKAGE).as_posix())
+    # Small compiled update for an untouched copy of the official AMD 2.1.9
+    # portable package. Full portable package.zip above remains self-contained.
+    with zipfile.ZipFile(STAGE / 'update.zip','w',zipfile.ZIP_DEFLATED,compresslevel=4) as update:
+        selected = {PACKAGE / 'veyra_qml_ui.exe'}
+        for folder in ('qml','shaders'):
+            selected.update(path for path in (PACKAGE / folder).rglob('*') if path.is_file())
+        for name in ('BUILD_RESULT.json','BUILD_OPTIONS.json','READ_ME_CAPTURE_TEST.txt','source-snapshot.zip',
+                     'THIRD_PARTY_NOTICES.md','latency-source.patch','capture-prediction-cmake.patch','capture-prediction-player.patch'):
+            selected.add(PACKAGE / name)
+        selected.add(PACKAGE / 'licenses/AMD-Anti-Lag-2-MIT.txt')
+        for file in sorted(selected): update.write(file, file.relative_to(PACKAGE).as_posix())
+        update.writestr('INSTALL_PREDICTION_UPDATE.txt',
+            'Compiled player update, not merely source code.\n'
+            'Close Veyra. Make a NEW copy of the original Veyra 2.1.9 AMD portable folder.\n'
+            'Extract this update INTO that copied folder, replacing EXE/QML/shaders when asked.\n'
+            'Run veyra_qml_ui.exe. In the Frame Generation tab, enable GPU capture prediction.\n'
+            'Reopen capture to apply the minimum device allocator. Start at 8 ms, 120 Hz and HUD protection on.\n'
+            'Do not layer this over another Veyra version. Full portable package is also available from the build.\n')
     print(json.dumps(result, indent=2), flush=True)
 
 

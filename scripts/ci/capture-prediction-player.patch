@@ -163,9 +163,22 @@ index 6b854dc..5f73df8 100644
      int nvidiaLowLatency() const;
      void setNvidiaLowLatency(int value);
      bool nvidiaLowLatencyAvailable() const;
+diff --git a/qml/Veyra/AmdLatencyEditor.qml b/qml/Veyra/AmdLatencyEditor.qml
+index 2b3a2f5..24a3899 100644
+--- a/qml/Veyra/AmdLatencyEditor.qml
++++ b/qml/Veyra/AmdLatencyEditor.qml
+@@ -13,7 +13,7 @@ ColumnLayout {
+         hint: qsTr("仅实时采集和原生呈现。XeSS 使用 XeLL，不叠加 AMD 等待。需要支持的 Radeon 显卡和驱动。")
+         VSwitch {
+             objectName: root.namePrefix+"-amd-anti-lag"
+-            enabled: root.backend.fgBackendName !== "xess" && !root.backend.presentationOwned
++            enabled: root.backend.fgBackendName !== "xess" && !root.backend.presentationOwned && root.backend.capturePrediction !== true
+             checked: root.backend.amdAntiLag
+             onToggled: checked => root.backend.amdAntiLag=checked
+         }
 diff --git a/qml/Veyra/CapturePredictionEditor.qml b/qml/Veyra/CapturePredictionEditor.qml
 new file mode 100644
-index 0000000..997736d
+index 0000000..fa07036
 --- /dev/null
 +++ b/qml/Veyra/CapturePredictionEditor.qml
 @@ -0,0 +1,66 @@
@@ -180,7 +193,7 @@ index 0000000..997736d
 +    VRow {
 +        label: qsTr("GPU capture prediction")
 +        hintBelow: true
-+        hint: qsTr("Experimental live preview. Uses observed motion to predict ahead without waiting for future frames. Enabling turns interpolation off and selects minimum capture buffering. Reopen capture to apply its allocator setting.")
++        hint: qsTr("Experimental live preview. Predicts observed motion without waiting for future frames. Enabling turns interpolation off, selects minimum capture buffering and uses its own refresh control with tearing allowed. Reopen capture to apply its allocator setting. Recordings keep the original source timeline.")
 +        VSwitch {
 +            objectName: root.namePrefix+"-capture-prediction"
 +            checked: root.backend.capturePrediction === true
@@ -236,9 +249,18 @@ index 0000000..997736d
 +    }
 +}
 diff --git a/qml/Veyra/NodePage.qml b/qml/Veyra/NodePage.qml
-index 1f05525..3087560 100644
+index 1f05525..e05eb9e 100644
 --- a/qml/Veyra/NodePage.qml
 +++ b/qml/Veyra/NodePage.qml
+@@ -815,7 +815,7 @@ VPage {
+                         ColumnLayout {
+                             Layout.fillWidth: true
+                             spacing: 6
+-                            enabled: !veyra.presentationOwned
++                            enabled: !veyra.presentationOwned && veyra.capturePrediction !== true
+                             opacity: enabled ? 1 : 0.5
+                             NodeLabel { text: veyra.presentationOwned ? qsTr("显示同步 · Intel XeSS 接管呈现") : qsTr("显示同步") }
+                             VSeg {
 @@ -1681,6 +1681,7 @@ VPage {
                  }
                  NvidiaLowLatencyEditor { namePrefix: "node" }
@@ -247,6 +269,19 @@ index 1f05525..3087560 100644
                  VRow {
                      visible: !veyra.nvidiaLowLatencyAvailable
                      label: qsTr("低延迟队列")
+diff --git a/qml/Veyra/NvidiaLowLatencyEditor.qml b/qml/Veyra/NvidiaLowLatencyEditor.qml
+index 5831252..333aeb1 100644
+--- a/qml/Veyra/NvidiaLowLatencyEditor.qml
++++ b/qml/Veyra/NvidiaLowLatencyEditor.qml
+@@ -14,7 +14,7 @@ ColumnLayout {
+         hint: !root.available ? qsTr("需要 NVIDIA 显卡") : ""
+         VSeg {
+             objectName: root.namePrefix+"-nvidia-low-latency"
+-            enabled: root.available
++            enabled: root.available && root.backend.capturePrediction !== true
+             opacity: enabled ? 1 : 0.4
+             options: [{id:"0",label:qsTr("关")},{id:"1",label:qsTr("开")}]
+             // Another adapter shows 关: the NVIDIA choice is kept for the next
 diff --git a/qml/Veyra/ProPage.qml b/qml/Veyra/ProPage.qml
 index 6ed5bf5..2d20e45 100644
 --- a/qml/Veyra/ProPage.qml
@@ -260,6 +295,45 @@ index 6ed5bf5..2d20e45 100644
                          VAccordion {
                              id: fgCard
                              objectName: "list-fg-card"
+diff --git a/qml/Veyra/ProPresentationRows.qml b/qml/Veyra/ProPresentationRows.qml
+index bdb1f5c..d5f3428 100644
+--- a/qml/Veyra/ProPresentationRows.qml
++++ b/qml/Veyra/ProPresentationRows.qml
+@@ -12,6 +12,7 @@ ColumnLayout {
+     spacing: 0
+     VRow {
+         label: qsTr("显示同步")
++        enabled: veyra.capturePrediction !== true
+         hint: qsTr("自动（推荐）：不撕裂，也不等待垂直同步，每次刷新显示最新一帧，延迟最低 · 垂直同步：每帧都等到刷新才显示，比自动多等最多一个刷新 · 允许撕裂：可能出现撕裂线")
+         VSeg {
+             objectName: "presentation-display-sync"
+@@ -28,7 +29,7 @@ ColumnLayout {
+         hint: veyra.vrrHint
+         VSwitch {
+             objectName: "presentation-vrr"
+-            enabled: veyra.vrrState >= 2
++            enabled: veyra.vrrState >= 2 && veyra.capturePrediction !== true
+             opacity: enabled ? 1 : 0.5
+             checked: veyra.variableRefresh
+             onToggled: checked => veyra.variableRefresh = checked
+@@ -37,7 +38,7 @@ ColumnLayout {
+     NvidiaVrrProfileRow { backend: presentationRows.profileTools }
+     VRow {
+         label: qsTr("输出上限")
+-        enabled: !veyra.presentationOwned
++        enabled: !veyra.presentationOwned && veyra.capturePrediction !== true
+         hint: veyra.presentationStatus
+         VSeg {
+             objectName: "presentation-output-rate"
+@@ -48,7 +49,7 @@ ColumnLayout {
+     }
+     VRow {
+         label: qsTr("自定义上限")
+-        enabled: !veyra.presentationOwned
++        enabled: !veyra.presentationOwned && veyra.capturePrediction !== true
+         visible: veyra.outputRateMode === 2
+         RowLayout {
+             spacing: 6
 diff --git a/shaders/CapturePredictionIngress.hlsl b/shaders/CapturePredictionIngress.hlsl
 new file mode 100644
 index 0000000..0c46378
@@ -293,10 +367,10 @@ index 0000000..0c46378
 +}
 diff --git a/src/engine/CapturePredictionSession.cpp b/src/engine/CapturePredictionSession.cpp
 new file mode 100644
-index 0000000..c271677
+index 0000000..64139d7
 --- /dev/null
 +++ b/src/engine/CapturePredictionSession.cpp
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,148 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "veyra/engine/CapturePredictionSession.h"
 +#include "veyra/pipeline/CapturePredictionPass.h"
@@ -319,11 +393,11 @@ index 0000000..c271677
 +    CapturePredictionPass predict[2];
 +    guidance::GpuDisOpticalFlow flow;
 +    uint32_t width=0,height=0,fw=0,fh=0,transfer=0;
-+    unsigned parity=1;
++    unsigned parity=1,flowPairs=0;
 +    uint64_t sequence=0,outputs=0;
 +    int64_t lastPresent=0,lastArrival=0,nextRefresh=0;
 +    double ageMs=0,lastCost=std::numeric_limits<double>::quiet_NaN();
-+    bool valid=false,initialized=false,failed=false,newInput=false;
++    bool valid=false,initialized=false,failed=false,newInput=false,imageHistory=false;
 +};
 +CapturePredictionSession::CapturePredictionSession():p_(std::make_unique<Impl>()){}
 +CapturePredictionSession::~CapturePredictionSession()=default;
@@ -372,18 +446,26 @@ index 0000000..c271677
 +void CapturePredictionSession::configure(PresentationSettings s){
 +    if(p_->settings.capturePrediction!=s.capturePrediction)reset();p_->settings=s;
 +}
-+void CapturePredictionSession::reset(){auto& p=*p_;p.clock.clear();p.identity={};p.valid=false;p.sequence=0;p.lastPresent=0;p.nextRefresh=0;p.newInput=false;p.decision={};}
++void CapturePredictionSession::reset(){auto& p=*p_;p.clock.clear();p.identity={};p.valid=false;p.imageHistory=false;p.flowPairs=0;p.sequence=0;p.lastPresent=0;p.nextRefresh=0;p.newInput=false;p.decision={};}
 +ID3D12Resource* CapturePredictionSession::record(ID3D12GraphicsCommandList* list,ID3D12CommandQueue* queue,ID3D12Fence* fence,uint64_t completion,
 +    unsigned sourceSlot,FrameIdentity id,int64_t pts,int64_t arrival,int64_t now,bool refresh){
 +    auto& p=*p_;if(!p.initialized||!p.settings.capturePrediction||p.failed||sourceSlot>=2||!list||!queue||!fence)return nullptr;
++    CapturePredictionSettings settings;settings.enabled=true;settings.compensationMs=p.settings.predictionLeadMs;
++    settings.maxHorizonMs=p.settings.predictionMaxHorizonMs;settings.maxIntervalFraction=1;
++    settings.displayPeriodMs=1000/p.settings.predictionRefreshHz;settings.maxGpuMs=2;
 +    const bool fresh=!p.valid||id!=p.identity;
 +    if(refresh&&fresh)return nullptr;
 +    if(fresh){
 +        const bool resetHistory=!p.valid||id.epoch!=p.identity.epoch||id.settingsRevision!=p.identity.settingsRevision;
-+        const auto old=p.parity;p.parity^=1;
 +        p.latest={id.epoch,id.settingsRevision,++p.sequence,pts,arrival,true,false,resetHistory};
 +        const auto accepted=p.clock.accept(p.latest);
-+        const bool history=!resetHistory&&accepted==PredictionReason::Ready;
++        const auto preliminary=p.clock.decide(settings,now);
++        if(preliminary.reason==PredictionReason::Budget||preliminary.reason==PredictionReason::Stale){
++            p.identity=id;p.valid=true;p.lastArrival=arrival;p.imageHistory=false;p.flowPairs=0;p.decision=preliminary;return nullptr;
++        }
++        const auto old=p.parity;p.parity^=1;
++        const bool history=p.imageHistory&&!resetHistory&&accepted==PredictionReason::Ready;
++        if(!history)p.flowPairs=0;
 +        const uint32_t dims[8]={p.width,p.height,p.fw,p.fh,p.transfer,0,0,0};
 +        const unsigned slot=(sourceSlot*2+p.parity)*3;
 +        // The producer handoff is GPU-side; both graph outputs are COMMON here.
@@ -400,18 +482,17 @@ index 0000000..c271677
 +            p.states.transition(list,p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
 +            p.states.transition(list,p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
 +            if(!p.flow.dispatch(list,queue,fence,completion,p.parity,p.flowColor[old].Get(),p.flowColor[p.parity].Get(),p.motion[p.parity].Get(),p.confidence[p.parity].Get(),p.sequence-1,p.sequence)){
-+                p.clock.clear();p.decision.reason=PredictionReason::Warmup;p.valid=false;return nullptr;
++                p.clock.clear();p.decision.reason=PredictionReason::Warmup;p.valid=false;p.imageHistory=false;p.flowPairs=0;return nullptr;
 +            }
++            p.flowPairs=std::min(2u,p.flowPairs+1);
 +            p.states.set(p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);p.states.set(p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
 +        }
-+        p.identity=id;p.valid=true;p.lastArrival=arrival;p.newInput=true;
++        p.identity=id;p.valid=true;p.imageHistory=true;p.lastArrival=arrival;p.newInput=true;
 +    }
-+    CapturePredictionSettings settings;settings.enabled=true;settings.compensationMs=p.settings.predictionLeadMs;
-+    settings.maxHorizonMs=p.settings.predictionMaxHorizonMs;settings.maxIntervalFraction=1;
-+    settings.displayPeriodMs=1000/p.settings.predictionRefreshHz;settings.maxGpuMs=2;
 +    p.decision=p.clock.decide(settings,now);p.ageMs=arrival>0&&now>=arrival?double(now-arrival)/10000:0;
++    if(p.flowPairs==0){p.decision.reason=PredictionReason::Warmup;return nullptr;}
 +    if(!p.decision.active())return nullptr;
-+    CapturePredictionPass::Parameters parameters;parameters.historyValid=true;parameters.accelerationValid=p.decision.acceleration;
++    CapturePredictionPass::Parameters parameters;parameters.historyValid=true;parameters.accelerationValid=p.decision.acceleration&&p.flowPairs>=2;
 +    parameters.horizonFraction=float(p.decision.intervalFraction);parameters.intervalRatio=float(p.decision.intervalRatio);
 +    if(p.settings.predictionProtectHud)parameters.protectedRegions={{{0,0,1,.10f},{0,.76f,.25f,1},{.75f,.76f,1,1},{.478f,.478f,.522f,.522f}}};
 +    const unsigned output=sourceSlot;
@@ -478,7 +559,7 @@ index 3e5bda7..fbd810e 100644
                              const double returnDeviation=deviationValid?nowMs()-itemPtsMs:0;
                              item.lease->consumerFence=presenter.consumerFenceValue(ring.lastSignaledValue());const bool didPresent=presenter.submittedCount()>before;s.blit=presenter.blitTiming(ctx.fence());
 diff --git a/src/engine/VideoPresenter.cpp b/src/engine/VideoPresenter.cpp
-index b895839..9144a2d 100644
+index b895839..b9f83b7 100644
 --- a/src/engine/VideoPresenter.cpp
 +++ b/src/engine/VideoPresenter.cpp
 @@ -93,7 +93,7 @@ bool VideoPresenter::open(gfx::D3D12DeviceContext& ctx,HWND window,pipeline::Enh
@@ -499,7 +580,7 @@ index b895839..9144a2d 100644
 +    return prediction_?prediction_->status():L"GPU capture prediction: waiting for live capture; original images until motion history is ready";
 +}
 +bool VideoPresenter::refreshPrediction(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,pipeline::EnhanceGraph& graph,PreviewView view){
-+    if(!predictionSettings_.capturePrediction||!prediction_||!predictionSource_.valid||!presentationQueue_||!presentationRing_.nextSlotReady())return true;
++    if(!predictionSettings_.capturePrediction||!prediction_||!predictionSource_.valid||!presentationQueue_||!presentationRing_.nextSlotReady()||presentationRing_.inFlightCount()!=0)return true;
 +    const auto now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()/100;
 +    if(!prediction_->due(now)||!sink_.presentationReady()||GetPropW(window_,L"Veyra.InteractiveMove")||GetPropW(window_,L"Veyra.DpiTransition"))return true;
 +    RECT rect{};if(!GetClientRect(window_,&rect)||unsigned(rect.right)!=viewWidth_||unsigned(rect.bottom)!=viewHeight_)return true;
@@ -627,6 +708,24 @@ index b895839..9144a2d 100644
      // The NVIDIA choice only runs on an NVIDIA adapter, where it implies the
      // low queue. Another adapter keeps the plain switch's value; the UI retains
      // the choice for the next NVIDIA session (syncNvidiaLowLatencyQueue).
+@@ -729,9 +785,15 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
+     // 1.4.4's latency" on a 60 Hz panel, 2026-10-01). Automatic replaces an
+     // unshown frame and Tearing never waits: acquiring the latency object
+     // there would throttle presents to the refresh, the wait they avoid.
+-    const bool paced=vsync&&sink_.configurePacing(true,vsync,tearing);
++    const bool paced=(vsync||requested.capturePrediction)&&sink_.configurePacing(true,vsync,tearing);
+     const bool restored=paced||sink_.configurePacing(false,vsync,tearing);
+-    const std::wstring queue=paced?(vrrSync_?L"可变刷新：超过屏幕最高刷新时只排 1 帧":L"垂直同步：屏幕队列 1 帧，读帧前等待刷新"):vsync?L"垂直同步：屏幕队列控制不可用":restored?L"":L"显示队列恢复失败";
++    if(requested.capturePrediction&&!paced){
++        effective.capturePrediction=false;predictionSettings_.capturePrediction=false;
++        if(prediction_)prediction_->configure(predictionSettings_);
++        status=L"GPU capture prediction unavailable: display-capacity control failed; showing original frames";
++        return effective;
++    }
++    const std::wstring queue=requested.capturePrediction?L"GPU prediction: display capacity 1; late forecasts skipped":paced?(vrrSync_?L"可变刷新：超过屏幕最高刷新时只排 1 帧":L"垂直同步：屏幕队列 1 帧，读帧前等待刷新"):vsync?L"垂直同步：屏幕队列控制不可用":restored?L"":L"显示队列恢复失败";
+     std::wstring cap;
+     if(followDisplay)cap=std::format(L"输出上限：跟随显示器 {:.0f} Hz",requested.customFps);
+     else if(requested.outputRate==OutputRateMode::Custom)cap=std::format(L"输出上限：{:.3f} FPS",requested.customFps);
 diff --git a/src/gfx/CommandSlotRing.cpp b/src/gfx/CommandSlotRing.cpp
 index 8e4a2e1..1c3d5c6 100644
 --- a/src/gfx/CommandSlotRing.cpp
@@ -699,7 +798,7 @@ index b4e6e0b..465708c 100644
  }
  
 diff --git a/src/ui/bridge/FrameGeneration.cpp b/src/ui/bridge/FrameGeneration.cpp
-index 28b9ca0..c4f275c 100644
+index 28b9ca0..12efbe8 100644
 --- a/src/ui/bridge/FrameGeneration.cpp
 +++ b/src/ui/bridge/FrameGeneration.cpp
 @@ -184,6 +184,27 @@ void QmlPlayerBridge::setAmdAntiLag(bool value){
@@ -737,7 +836,7 @@ index 28b9ca0..c4f275c 100644
 -QString QmlPlayerBridge::presentationStatus() const { return uiText(impl_->snapshot.presentationStatus); }
 +QString QmlPlayerBridge::presentationStatus() const {
 +    if(capturePrediction()&&impl_->snapshot.running&&!impl_->snapshot.presentationEffective.capturePrediction)
-+        return QStringLiteral("GPU capture prediction is inactive: use a live capture source with interpolation disabled");
++        return QStringLiteral("GPU capture prediction inactive (requires live capture, interpolation off and display capacity). ")+uiText(impl_->snapshot.presentationStatus);
 +    return uiText(impl_->snapshot.presentationStatus);
 +}
  void QmlPlayerBridge::applyPresentation() {
