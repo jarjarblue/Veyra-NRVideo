@@ -1,0 +1,56 @@
+name: Capture prediction core validation
+on:
+  push:
+    branches: ['codex/gpu-capture-prediction']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prediction-core:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          persist-credentials: false
+      - name: Apply reviewed source and build-registration deltas
+        run: |
+          git apply --check scripts/ci/latency-source.patch
+          git apply scripts/ci/latency-source.patch
+          git apply --check scripts/ci/capture-prediction-cmake.patch
+          git apply scripts/ci/capture-prediction-cmake.patch
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile prediction controller and real D3D12 shaders
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force out/prediction/shaders | Out-Null
+          $dxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/dxc.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$dxc) { throw 'Windows SDK DXC is required' }
+          foreach ($name in @('Scene','Prepare','Warp')) {
+            & $dxc.FullName -T cs_6_0 -E main -O3 -WX -Fo "out/prediction/shaders/CapturePrediction$name.dxil" "shaders/CapturePrediction$name.hlsl"
+          }
+          cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Iinclude tests/unit/CapturePredictionTests.cpp /Fe:out/prediction/clock-tests.exe /Fo:out/prediction/clock-tests.obj
+          cl /nologo /std:c++20 /EHsc /W4 /utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Iinclude tests/integration/CapturePredictionGpuTests.cpp src/pipeline/CapturePredictionPass.cpp src/base/Log.cpp src/base/RuntimePaths.cpp /Fe:out/prediction/gpu-tests.exe /Fo:out/prediction/ /link d3d12.lib dxgi.lib d3dcompiler.lib
+      - name: Test timing and actual forecast pixels on D3D12 WARP
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          out/prediction/clock-tests.exe | Tee-Object out/prediction/clock-results.txt
+          out/prediction/gpu-tests.exe | Tee-Object out/prediction/gpu-results.txt
+      - name: Retain development test harness and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Capture-Prediction-Core-Development
+          path: |
+            out/prediction/*.exe
+            out/prediction/*results.txt
+            out/prediction/shaders/*.dxil
+          retention-days: 14

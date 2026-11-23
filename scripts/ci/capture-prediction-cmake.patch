@@ -1,0 +1,32 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 10c1cc2..5184d14 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,7 +117,8 @@ veyra_apply_warnings(veyra_logger_tests)
+ # Driver-independent lifecycle and 30 -> 120 fallback cadence contracts.
+ add_executable(veyra_anti_lag_tests tests/unit/AntiLagSessionTests.cpp)
+ add_executable(veyra_xess_fallback_tests tests/unit/XessFallbackCadenceTests.cpp)
+-foreach(test_target veyra_anti_lag_tests veyra_xess_fallback_tests)
++add_executable(veyra_capture_prediction_tests tests/unit/CapturePredictionTests.cpp)
++foreach(test_target veyra_anti_lag_tests veyra_xess_fallback_tests veyra_capture_prediction_tests)
+   target_compile_features(${test_target} PRIVATE cxx_std_20)
+   target_include_directories(${test_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+ endforeach()
+@@ -344,6 +345,17 @@ veyra_add_compute_shader(veyra_shader_nr_hold NrHold)
+ # NR inference reuse (realtime preview only, default off).
+ veyra_add_compute_shader(veyra_shader_nr_reuse_compose NrReuseCompose)
+ veyra_add_compute_shader(veyra_shader_nr_reuse_warp NrReuseWarp)
++veyra_add_compute_shader(veyra_shader_capture_prediction_scene CapturePredictionScene)
++veyra_add_compute_shader(veyra_shader_capture_prediction_prepare CapturePredictionPrepare)
++veyra_add_compute_shader(veyra_shader_capture_prediction_warp CapturePredictionWarp)
++
++# Independent development core: no proprietary runtime, Qt or FFmpeg required.
++add_library(veyra_capture_prediction STATIC src/pipeline/CapturePredictionPass.cpp)
++target_link_libraries(veyra_capture_prediction PUBLIC veyra_base d3d12 dxgi d3dcompiler)
++add_dependencies(veyra_capture_prediction veyra_shader_capture_prediction_scene
++  veyra_shader_capture_prediction_prepare veyra_shader_capture_prediction_warp)
++add_executable(veyra_capture_prediction_gpu_tests tests/integration/CapturePredictionGpuTests.cpp)
++target_link_libraries(veyra_capture_prediction_gpu_tests PRIVATE veyra_capture_prediction)
+ veyra_add_compute_shader(veyra_shader_flow_adapt FlowAdapt)
+ veyra_add_compute_shader(veyra_shader_flow_refine FlowRefine)
+ veyra_add_compute_shader(veyra_shader_flow_fill FlowFill)
