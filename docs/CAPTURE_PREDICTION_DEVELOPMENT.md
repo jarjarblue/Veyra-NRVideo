@@ -77,3 +77,37 @@ presentation path and is an alternative to XeSS interpolation.
 Algorithm implementation is original project code, GPL-3.0-only, reusing the
 existing descriptor/state helpers and HUD-region shader helper. No third-party
 model, driver or proprietary runtime is added or changed.
+
+## Verified milestone — November 22, 2026 (America/Chicago)
+
+- Local GCC C++20, `-Wall -Wextra -Werror -pedantic`: 2434 controller checks,
+  zero failures. Many checks are repeated refresh decisions, not distinct cases.
+- Windows Server 2022 / MSVC / Ninja Release: configure and both new CMake
+  targets passed with parallelism two, without Qt/FFmpeg/proprietary SDKs.
+- Actual DXC shader execution on D3D12 WARP: 9303 checks, zero failures,
+  including acceleration truth, sudden stops, displacement limits, HUD pixels,
+  reset, scene cut, NaN flow, border fallback, slot and alias guards. Most checks
+  are individual HUD pixels. D3D12 debug layer available, no error/corruption.
+- Known-motion constant-translation interior MAE: latest-frame hold 0.0295281,
+  forecast zero, versus independently rendered truth in the tested channel.
+  This simple integer translation case proves correctness, not gameplay quality.
+- Tested fork source `79036c5e9311cb7a4dffb4cbf9b61c2f3c4a9236`:
+  [successful validation](https://github.com/jarjarblue/Veyra-NRVideo/actions/runs/45102859359).
+  Development harness artifact 14786291607 is 452595 bytes, retained 14 days;
+  **it is not a Veyra player build**.
+- The first direct MSVC/DXC run passed too. An intermediate CMake run failed:
+  upstream unconditionally attached resources/link options to the absent optional
+  `veyra` target. Both calls are now guarded; the final CMake run passed.
+
+The fork retains the earlier source-delta layout: its workflow applies
+`scripts/ci/latency-source.patch` and then
+`scripts/ci/capture-prediction-cmake.patch` before building the new core files.
+The local feature branch already has the first patch applied and tracks its
+CMake changes directly. Existing player binaries are unchanged; the new core
+is not referenced by the production graph or presenter.
+
+Local results: `build/capture-prediction` and `reports/capture-prediction` in
+this workspace. Compiled controller is approximately 40 KiB. No runtime donor,
+model or duplicate runtime was added, and nothing was deleted. Physical Radeon
+execution, gameplay motion quality, sustained 1080p/4K GPU cost, end-to-end
+capture delay and production-player integration remain unverified/unfinished.
