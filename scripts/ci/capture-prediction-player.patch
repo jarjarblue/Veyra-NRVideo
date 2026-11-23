@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 866cb0e..ce718f0 100644
+index 866cb0e..f391b0c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -348,6 +348,7 @@ veyra_add_compute_shader(veyra_shader_nr_reuse_warp NrReuseWarp)
@@ -10,7 +10,16 @@ index 866cb0e..ce718f0 100644
  
  # Independent development core: no proprietary runtime, Qt or FFmpeg required.
  add_library(veyra_capture_prediction STATIC src/pipeline/CapturePredictionPass.cpp)
-@@ -1553,6 +1554,11 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+@@ -1272,6 +1273,8 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
+   # piece of the old shell worth keeping, and its own dialog is what users
+   # expect from a desktop app. No QWidget UI is created.
+   target_link_libraries(veyra_qml_bridge PUBLIC veyra_engine Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets PRIVATE shell32)
++  add_executable(veyra_capture_prediction_preferences_tests tests/qml/CapturePredictionPreferencesTests.cpp)
++  target_link_libraries(veyra_capture_prediction_preferences_tests PRIVATE veyra_qml_bridge)
+   add_executable(veyra_playlist_tests tests/unit/PlaylistModelTests.cpp src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h)
+   set_target_properties(veyra_playlist_tests PROPERTIES AUTOMOC ON)
+   target_compile_features(veyra_playlist_tests PRIVATE cxx_std_20)
+@@ -1553,6 +1556,11 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
  
    # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
    add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
@@ -284,10 +293,10 @@ index 0000000..0c46378
 +}
 diff --git a/src/engine/CapturePredictionSession.cpp b/src/engine/CapturePredictionSession.cpp
 new file mode 100644
-index 0000000..defa17f
+index 0000000..c271677
 --- /dev/null
 +++ b/src/engine/CapturePredictionSession.cpp
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,141 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "veyra/engine/CapturePredictionSession.h"
 +#include "veyra/pipeline/CapturePredictionPass.h"
@@ -295,6 +304,7 @@ index 0000000..defa17f
 +#include <dxgi1_4.h>
 +#include <bit>
 +#include <format>
++#include <limits>
 +namespace veyra::engine {
 +using namespace pipeline;
 +struct CapturePredictionSession::Impl {
@@ -312,7 +322,7 @@ index 0000000..defa17f
 +    unsigned parity=1;
 +    uint64_t sequence=0,outputs=0;
 +    int64_t lastPresent=0,lastArrival=0,nextRefresh=0;
-+    double ageMs=0,lastCost=0;
++    double ageMs=0,lastCost=std::numeric_limits<double>::quiet_NaN();
 +    bool valid=false,initialized=false,failed=false,newInput=false;
 +};
 +CapturePredictionSession::CapturePredictionSession():p_(std::make_unique<Impl>()){}
@@ -421,10 +431,11 @@ index 0000000..defa17f
 +    if(p.newInput||p.nextRefresh<=0){p.nextRefresh=now+interval;p.newInput=false;}
 +    else if(p.nextRefresh<=now)p.nextRefresh+=((now-p.nextRefresh)/interval+1)*interval;
 +}
-+void CapturePredictionSession::gpuCost(double ms){p_->clock.gpuCost(ms);p_->lastCost=ms;}
++void CapturePredictionSession::gpuCost(double ms){if(!std::isfinite(ms)||ms<0)return;p_->clock.gpuCost(ms);p_->lastCost=ms;}
 +std::wstring CapturePredictionSession::status()const{
 +    const auto& p=*p_;const wchar_t* state=p.decision.active()?L"active":p.decision.reason==PredictionReason::Budget?L"GPU budget bypass":p.decision.reason==PredictionReason::Stale?L"stale source bypass":L"warming up / original image";
-+    return std::format(L"GPU capture prediction: {} | predicted horizon {:.1f} ms | PC ingress age {:.1f} ms | GPU {:.2f} ms | no added frame buffer (not measured latency saved)",state,p.decision.horizonMs,p.ageMs,p.lastCost);
++    const auto cost=std::isfinite(p.lastCost)?std::format(L"{:.2f}",p.lastCost):L"unmeasured";
++    return std::format(L"GPU capture prediction: {} | predicted horizon {:.1f} ms | PC ingress age {:.1f} ms | GPU {} ms | no added frame buffer (not measured latency saved)",state,p.decision.horizonMs,p.ageMs,cost);
 +}
 +}
 diff --git a/src/engine/EngineController.cpp b/src/engine/EngineController.cpp
@@ -662,34 +673,36 @@ index d54076e..569168b 100644
      auto s = settings(); s.captureBuffer = static_cast<source::CaptureBufferMode>(value);
      if(impl_->commit(std::move(s))){impl_->prefs["captureBufferMode"]=value;if(!impl_->savePrefs())emit notice(tr("采集设置保存失败，请检查配置目录是否可写"),true);}
 diff --git a/src/ui/bridge/Chain.cpp b/src/ui/bridge/Chain.cpp
-index 820882b..47231b1 100644
+index 820882b..3f83c81 100644
 --- a/src/ui/bridge/Chain.cpp
 +++ b/src/ui/bridge/Chain.cpp
-@@ -685,6 +685,7 @@ int QmlPlayerBridge::duplicateNrLayer(int index){
- bool QmlPlayerBridge::removeEffect(int index) {
-     auto& c = impl_->chain;
-     if (index < 0 || uint32_t(index) >= c.nodeCount) return false;
+@@ -761,6 +761,7 @@ bool QmlPlayerBridge::setEffectEnabled(int index, bool enabled) {
+         const auto error=impl_->validation.message;c.nodes[index].enabled=!enabled;
+         impl_->revalidate();emit notice(uiText(error),true);return false;
+     }
 +    if(enabled&&c.nodes[index].type==engine::EffectType::FrameGeneration&&capturePrediction())setCapturePrediction(false);
-     const auto& info = engine::effectInfo(c.nodes[index].type);
-     if (info.mustBeLast) { emit notice(tr("补帧固定为最后一步，不能删除"), true); return false; }
-     const auto before=c; const int selected=impl_->selectedNr,colourSelected=impl_->selectedColour;
+     emitChainChanged();
+     emit settingsChanged();
+     return true;
 diff --git a/src/ui/bridge/Enhancement.cpp b/src/ui/bridge/Enhancement.cpp
-index b4e6e0b..4e793a2 100644
+index b4e6e0b..465708c 100644
 --- a/src/ui/bridge/Enhancement.cpp
 +++ b/src/ui/bridge/Enhancement.cpp
-@@ -1126,6 +1126,7 @@ void QmlPlayerBridge::setFgMultiplier(int multiplier) {
-     auto* node = chain.firstOf(engine::EffectType::FrameGeneration);
-     if (!node) { if (multiplier > 1) emit notice(tr("请先添加补帧节点"), true); return; }
-     const bool enabled = multiplier > 1;
+@@ -1133,7 +1133,9 @@ void QmlPlayerBridge::setFgMultiplier(int multiplier) {
+         const auto error = impl_->validation.message;
+         node->enabled = beforeEnabled; chain.fgMultiplier = beforeMultiplier; impl_->revalidate();
+         emit notice(uiText(error), true);
++        emit settingsChanged();emitChainChanged();return;
+     }
 +    if(enabled&&capturePrediction())setCapturePrediction(false);
-     if (node->enabled == enabled && (!enabled || chain.fgMultiplier == uint32_t(multiplier))) return;
-     const auto beforeMultiplier = chain.fgMultiplier; const auto beforeEnabled = node->enabled;
-     node->enabled = enabled; if (enabled) chain.fgMultiplier = uint32_t(multiplier);
+     emit settingsChanged(); emitChainChanged();
+ }
+ 
 diff --git a/src/ui/bridge/FrameGeneration.cpp b/src/ui/bridge/FrameGeneration.cpp
-index 28b9ca0..2a1c8f7 100644
+index 28b9ca0..c4f275c 100644
 --- a/src/ui/bridge/FrameGeneration.cpp
 +++ b/src/ui/bridge/FrameGeneration.cpp
-@@ -184,6 +184,26 @@ void QmlPlayerBridge::setAmdAntiLag(bool value){
+@@ -184,6 +184,27 @@ void QmlPlayerBridge::setAmdAntiLag(bool value){
      impl_->presentation.amdAntiLag=value;applyPresentation();
  }
  bool QmlPlayerBridge::xessResponsiveFallback()const{return impl_->presentation.xessResponsiveFallback;}
@@ -701,6 +714,7 @@ index 28b9ca0..2a1c8f7 100644
 +        for(unsigned i=0;i<impl_->chain.nodeCount;++i)if(impl_->chain.nodes[i].type==engine::EffectType::FrameGeneration)impl_->chain.nodes[i].enabled=false;
 +        if(!impl_->revalidate(true)){impl_->chain=previous;impl_->revalidate();emit settingsChanged();return;}
 +        setCaptureBufferMode(1); // minimum device allocator, applied on next connect
++        if(captureBufferMode()!=1){impl_->chain=previous;impl_->revalidate(true);emit notice(QStringLiteral("Unable to select minimum capture buffering; prediction was not enabled"),true);return;}
 +        emitChainChanged();
 +    }
 +    impl_->presentation.capturePrediction=value;applyPresentation();
@@ -716,7 +730,18 @@ index 28b9ca0..2a1c8f7 100644
  void QmlPlayerBridge::setXessResponsiveFallback(bool value){
      if(impl_->presentation.xessResponsiveFallback==value)return;
      impl_->presentation.xessResponsiveFallback=value;applyPresentation();
-@@ -381,7 +401,10 @@ void QmlPlayerBridge::applyPresentation() {
+@@ -375,14 +396,22 @@ void QmlPlayerBridge::setOutputCustomFps(double value) {
+     applyPresentation();
+ }
+ bool QmlPlayerBridge::presentationOwned() const { return impl_->snapshot.presentationProviderOwned; }
+-QString QmlPlayerBridge::presentationStatus() const { return uiText(impl_->snapshot.presentationStatus); }
++QString QmlPlayerBridge::presentationStatus() const {
++    if(capturePrediction()&&impl_->snapshot.running&&!impl_->snapshot.presentationEffective.capturePrediction)
++        return QStringLiteral("GPU capture prediction is inactive: use a live capture source with interpolation disabled");
++    return uiText(impl_->snapshot.presentationStatus);
++}
+ void QmlPlayerBridge::applyPresentation() {
+     auto& p = impl_->presentation;
      if (!p.valid()) return;
      impl_->engine.requestPresentation(p);
      impl_->prefs[QStringLiteral("presentation")] = QVariantMap{
@@ -726,8 +751,10 @@ index 28b9ca0..2a1c8f7 100644
 +        {"predictionMaxHorizonMs",p.predictionMaxHorizonMs},{"predictionProtectHud",p.predictionProtectHud},
 +        {"nvidiaLowLatency",int(p.nvidiaLowLatency)}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}, {"vrr", p.variableRefresh}};
      if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "presentation settings not saved");
++    veyra::log::info("capture-prediction-ui",std::format("requested={} leadMs={} refreshHz={} horizonMs={} hudProtection={}",p.capturePrediction,p.predictionLeadMs,p.predictionRefreshHz,p.predictionMaxHorizonMs,p.predictionProtectHud));
      veyra::log::info("ui-presentation", std::format("lowQueue={} nvidiaLowLatency={} display={} outputRate={} customFps={:.3f} variableRefresh={}",
          p.enabled, int(p.nvidiaLowLatency), int(p.display), int(p.outputRate), p.customFps, p.variableRefresh));
+     emit presentationChanged();
 diff --git a/tests/integration/CapturePredictionGpuTests.cpp b/tests/integration/CapturePredictionGpuTests.cpp
 index fda708a..43df0d5 100644
 --- a/tests/integration/CapturePredictionGpuTests.cpp
@@ -809,3 +836,115 @@ index 0000000..f03c1df
 +    session.reset();require(!session.due(200000000),"reset clears refresh ownership");
 +    t.checkDebug();std::cout<<"GPU DIS + capture prediction integration PASS (WARP, not Radeon performance)\n";return 0;
 +}catch(const std::exception& error){std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
+diff --git a/tests/qml/CapturePredictionPreferencesTests.cpp b/tests/qml/CapturePredictionPreferencesTests.cpp
+new file mode 100644
+index 0000000..0d6e067
+--- /dev/null
++++ b/tests/qml/CapturePredictionPreferencesTests.cpp
+@@ -0,0 +1,31 @@
++#include "veyra/engine/EngineController.h"
++#include "veyra/ui/QmlPlayerBridge.h"
++#include <QGuiApplication>
++#include <filesystem>
++#include <iostream>
++#include <limits>
++#include <cstdlib>
++int main(int argc,char** argv){
++    QGuiApplication app(argc,argv);if(argc!=2)return 2;
++    const std::filesystem::path profile=argv[1];std::filesystem::create_directories(profile);
++    unsigned checks=0;auto check=[&](bool v,const char* label){++checks;if(!v){std::cerr<<"FAIL "<<label<<'\n';std::exit(1);}};
++    {
++        veyra::engine::EngineController engine;veyra::ui::QmlPlayerBridge bridge(engine,profile);
++        check(!bridge.capturePrediction(),"new profiles default to prediction off");
++        bridge.setCapturePrediction(true);check(bridge.capturePrediction(),"mode enabled");
++        check(!bridge.fgEnabled(),"interpolation disabled for native prediction");
++        check(bridge.captureBufferMode()==1,"minimum capture allocator requested");
++        bridge.setCaptureBufferMode(0);check(bridge.captureBufferMode()==1,"mode keeps minimum buffering");
++        bridge.setPredictionLeadMs(12.5);bridge.setPredictionRefreshHz(144);bridge.setPredictionMaxHorizonMs(40);bridge.setPredictionProtectHud(false);
++        bridge.setPredictionLeadMs(std::numeric_limits<double>::infinity());check(bridge.predictionLeadMs()==12.5,"reject invalid lead");
++        bridge.setPredictionRefreshHz(999);check(bridge.predictionRefreshHz()==144,"reject invalid refresh");
++    }
++    {
++        veyra::engine::EngineController engine;veyra::ui::QmlPlayerBridge bridge(engine,profile);
++        check(bridge.capturePrediction(),"mode survives restart");check(!bridge.fgEnabled(),"interpolation stays off after restart");
++        check(bridge.captureBufferMode()==1,"allocator preference survives restart");
++        check(bridge.predictionLeadMs()==12.5&&bridge.predictionRefreshHz()==144&&bridge.predictionMaxHorizonMs()==40&&!bridge.predictionProtectHud(),"all controls survive restart");
++        bridge.setCapturePrediction(false);check(!bridge.capturePrediction(),"mode can be disabled");
++    }
++    std::cout<<"Prediction real bridge/preferences: "<<checks<<" checks, 0 failures\n";return 0;
++}
+diff --git a/tests/qml/QuickSmokeTests.cpp b/tests/qml/QuickSmokeTests.cpp
+index 7efbbc1..b1f9777 100644
+--- a/tests/qml/QuickSmokeTests.cpp
++++ b/tests/qml/QuickSmokeTests.cpp
+@@ -68,6 +68,11 @@ QtObject {
+     property bool amdAntiLagAvailable: false
+     property bool amdAntiLag: false
+     property bool xessResponsiveFallback: false
++    property bool capturePrediction: false
++    property real predictionLeadMs: 8
++    property real predictionRefreshHz: 120
++    property real predictionMaxHorizonMs: 33
++    property bool predictionProtectHud: true
+     property bool presentationOwned: false
+     property string fgBackendName: "fsr3"
+     property bool running: false
+@@ -105,6 +110,8 @@ QtObject {
+             QStringLiteral("qml/Veyra/NvidiaLowLatencyEditor.qml"))), "VeyraTest", 1, 0, "NvidiaLowLatencyEditor");
+         qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
+             QStringLiteral("qml/Veyra/AmdLatencyEditor.qml"))), "VeyraTest", 1, 0, "AmdLatencyEditor");
++        qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
++            QStringLiteral("qml/Veyra/CapturePredictionEditor.qml"))), "VeyraTest", 1, 0, "CapturePredictionEditor");
+     }
+ };
+ 
+diff --git a/tests/qml/quick/tst_capture_prediction.qml b/tests/qml/quick/tst_capture_prediction.qml
+new file mode 100644
+index 0000000..f10ad1d
+--- /dev/null
++++ b/tests/qml/quick/tst_capture_prediction.qml
+@@ -0,0 +1,44 @@
++import QtQuick
++import QtQuick.Layouts
++import QtTest
++import Veyra
++import VeyraTest 1.0
++Item {
++    width: 700; height: 900
++    QtObject {
++        id: bridge
++        property bool capturePrediction: false
++        property real predictionLeadMs: 8
++        property real predictionRefreshHz: 120
++        property real predictionMaxHorizonMs: 33
++        property bool predictionProtectHud: true
++    }
++    ColumnLayout {
++        width: parent.width
++        CapturePredictionEditor { id: list; backend: bridge; namePrefix: "pred-list" }
++        CapturePredictionEditor { id: node; backend: bridge; namePrefix: "pred-node" }
++    }
++    TestCase {
++        name: "CapturePredictionControls"
++        when: windowShown
++        function control(editor, name) { return findChild(editor,editor.namePrefix+"-"+name) }
++        function init(){bridge.capturePrediction=false;bridge.predictionLeadMs=8;bridge.predictionRefreshHz=120;bridge.predictionMaxHorizonMs=33;bridge.predictionProtectHud=true;wait(20)}
++        function test_enable_and_shared_controls(){
++            mouseClick(control(list,"capture-prediction"));compare(bridge.capturePrediction,true)
++            compare(control(node,"capture-prediction").checked,true)
++            control(list,"prediction-lead").commitValue(12.5)
++            compare(bridge.predictionLeadMs,12.5);compare(control(node,"prediction-lead").value,12.5)
++            control(list,"prediction-refresh").commitValue(144)
++            compare(bridge.predictionRefreshHz,144)
++            control(list,"prediction-horizon").commitValue(40)
++            compare(bridge.predictionMaxHorizonMs,40)
++            mouseClick(control(list,"prediction-hud"));compare(bridge.predictionProtectHud,false)
++        }
++        function test_slider_limits(){
++            bridge.capturePrediction=true;wait(20)
++            control(list,"prediction-lead").commitValue(999);compare(bridge.predictionLeadMs,30)
++            control(list,"prediction-refresh").commitValue(999);compare(bridge.predictionRefreshHz,240)
++            control(list,"prediction-horizon").commitValue(-20);compare(bridge.predictionMaxHorizonMs,1)
++        }
++    }
++}

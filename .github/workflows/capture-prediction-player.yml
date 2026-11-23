@@ -42,7 +42,7 @@ jobs:
         run: python scripts/ci/prepare-capture-build.py
       - name: Build the complete player and prediction tests
         timeout-minutes: 15
-        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests veyra_qml_quick_tests
+        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests veyra_capture_prediction_preferences_tests veyra_qml_quick_tests
       - name: Verify controller and actual estimated-motion prediction
         timeout-minutes: 5
         run: |
@@ -58,8 +58,12 @@ jobs:
           QT_QUICK_BACKEND: software
           QT_QPA_PLATFORM: offscreen
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = "$pwd/out/capture-ci/donor/Veyra-2.1.9-AMD-win64-portable;$env:PATH"
+          out/capture-ci/build/veyra_capture_prediction_preferences_tests.exe out/capture-ci/prediction-profile-test
           Copy-Item -Recurse tests/qml/quick out/capture-ci/build/qml-tests
-          out/capture-ci/build/veyra_qml_quick_tests.exe AmdLatencyOwnership::test_defaults_and_shared_preference AmdLatencyOwnership::test_xess_never_offers_stacked_anti_lag
+          out/capture-ci/build/veyra_qml_quick_tests.exe AmdLatencyOwnership::test_defaults_and_shared_preference AmdLatencyOwnership::test_xess_never_offers_stacked_anti_lag CapturePredictionControls::test_enable_and_shared_controls CapturePredictionControls::test_slider_limits
       - name: Stage portable prediction player and startup check
         run: python scripts/ci/stage-prediction-build.py
       - uses: actions/upload-artifact@v4
