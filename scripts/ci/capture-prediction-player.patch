@@ -367,7 +367,7 @@ index 0000000..0c46378
 +}
 diff --git a/src/engine/CapturePredictionSession.cpp b/src/engine/CapturePredictionSession.cpp
 new file mode 100644
-index 0000000..51550b8
+index 0000000..8f83406
 --- /dev/null
 +++ b/src/engine/CapturePredictionSession.cpp
 @@ -0,0 +1,148 @@
@@ -482,7 +482,7 @@ index 0000000..51550b8
 +            p.states.transition(list,p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
 +            p.states.transition(list,p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
 +            if(!p.flow.dispatch(list,queue,fence,completion,p.parity,p.flowColor[old].Get(),p.flowColor[p.parity].Get(),p.motion[p.parity].Get(),p.confidence[p.parity].Get(),p.sequence-1,p.sequence)){
-+                p.clock.clear();p.decision.reason=PredictionReason::Warmup;p.valid=false;p.imageHistory=false;p.flowPairs=0;return nullptr;
++                p.clock.clear();p.decision.reason=PredictionReason::Warmup;p.valid=false;p.imageHistory=false;p.flowPairs=0;p.failed=true;return nullptr;
 +            }
 +            p.flowPairs=std::min(2u,p.flowPairs+1);
 +            p.states.set(p.motion[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);p.states.set(p.confidence[p.parity].Get(),D3D12_RESOURCE_STATE_COMMON);
@@ -514,16 +514,34 @@ index 0000000..51550b8
 +}
 +void CapturePredictionSession::gpuCost(double ms){if(!std::isfinite(ms)||ms<0)return;p_->clock.gpuCost(ms);p_->lastCost=ms;}
 +std::wstring CapturePredictionSession::status()const{
-+    const auto& p=*p_;const wchar_t* state=p.decision.active()?L"active":p.decision.reason==PredictionReason::Budget?L"GPU budget bypass":p.decision.reason==PredictionReason::Stale?L"stale source bypass":L"warming up / original image";
++    const auto& p=*p_;const wchar_t* state=p.failed?L"motion estimation unavailable / original image":p.decision.active()?L"active":p.decision.reason==PredictionReason::Budget?L"GPU budget bypass":p.decision.reason==PredictionReason::Stale?L"stale source bypass":L"warming up / original image";
 +    const auto cost=std::isfinite(p.lastCost)?std::format(L"{:.2f}",p.lastCost):L"unmeasured";
 +    return std::format(L"GPU capture prediction: {} | predicted horizon {:.1f} ms | PC ingress age {:.1f} ms | GPU {} ms | no added frame buffer (not measured latency saved)",state,p.decision.horizonMs,p.ageMs,cost);
 +}
 +}
 diff --git a/src/engine/EngineController.cpp b/src/engine/EngineController.cpp
-index 3e5bda7..fbd810e 100644
+index 3e5bda7..b7bf105 100644
 --- a/src/engine/EngineController.cpp
 +++ b/src/engine/EngineController.cpp
-@@ -1469,6 +1469,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+@@ -1410,11 +1410,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+                 // Poll completed display/VRR queries before comparing policy.
+                 // It must not make synchronous driver calls on the GPU owner.
+                 const double refreshHz=presenter.displayRefreshHz();
+-                const bool capRefreshChanged=requested.outputRate==OutputRateMode::FollowDisplay&&std::abs(refreshHz-pacingRefreshHz)>0.001;
++                auto displayPolicy=requested;
++                if(requested.capturePrediction&&isCapture&&!options.fg&&!presenter.xessActive()){
++                    displayPolicy.variableRefresh=false;displayPolicy.outputRate=OutputRateMode::Off;
++                }
++                const bool capRefreshChanged=displayPolicy.outputRate==OutputRateMode::FollowDisplay&&std::abs(refreshHz-pacingRefreshHz)>0.001;
+                 // 可变刷新: the monitor's VRR availability is read again on events
+                 // (another monitor, a display change, 重新检测, the VRR
+                 // confirmation); a change re-applies.
+-                const bool vrrChanged=presenter.vrrSync()!=VideoPresenter::vrrSyncWanted(requested,presenter.displayVrr());
++                const bool vrrChanged=presenter.vrrSync()!=VideoPresenter::vrrSyncWanted(displayPolicy,presenter.displayVrr());
+                 if(revision==pacingRevision&&presenterGeneration==presenter.generation()&&!vrrChanged&&!capRefreshChanged){
+                     // Reflex dropped out at runtime: the queue-depth part of the
+                     // low-latency setting stays, so only the status line changes.
+@@ -1469,6 +1473,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
              const bool checkpointPresentation=GetEnvironmentVariableW(L"VEYRA_TEST_NO_PROCESS_PRESENT",nullptr,0)==0;
              const bool capturePresentAfterReady=GetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_PRESENT_AFTER_READY",nullptr,0)>0;
              bool processingGraph=false;
@@ -540,7 +558,7 @@ index 3e5bda7..fbd810e 100644
              auto waitLive=[&]{
                  const auto due=liveScheduler?liveScheduler->wakeAt():0;
                  const auto arrivalEvent=physicalCapture?captureSource.frameEvent():nullptr;
-@@ -2076,7 +2086,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+@@ -2076,7 +2090,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                          advanceLive();publishWaitingProgress();waitLive();rs=physicalCapture?captureSource.tryRead(pkt,&frame):activeSource->read(pkt,&frame);
                      }
                      if(stop_)break;
@@ -549,7 +567,7 @@ index 3e5bda7..fbd810e 100644
                      if(rs==source::SourceReadStatus::Eos){
                          fileInputEnded=true;
                          while(liveScheduler&&liveScheduler->occupancy()&&!stop_&&(!paused_||seekPreviewPending)&&!liveScheduler->failed()){advanceLive();if(liveScheduler->occupancy())waitLive();}
-@@ -2940,7 +2950,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
+@@ -2940,7 +2954,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                              const auto begin=Clock::now();const auto before=presenter.submittedCount();
                              presenter.reflexFrame(watch->reflexFrame);
                              presenter.observeHdrCoverage(hdrCoverageObserved_.load());
@@ -894,10 +912,10 @@ index fda708a..98b8c5c 100644
 +#endif
 diff --git a/tests/integration/CapturePredictionSessionTests.cpp b/tests/integration/CapturePredictionSessionTests.cpp
 new file mode 100644
-index 0000000..f03c1df
+index 0000000..5c5a04f
 --- /dev/null
 +++ b/tests/integration/CapturePredictionSessionTests.cpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,67 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#define VEYRA_PREDICTION_GPU_TEST_HELPERS
 +#include "CapturePredictionGpuTests.cpp"
@@ -953,6 +971,15 @@ index 0000000..f03c1df
 +    require(forecasts>=8,"real estimated-motion warmup produces forecasts");
 +    std::cout<<"Estimated-motion session error "<<holdError<<" -> "<<error<<" forecasts="<<forecasts<<'\n';
 +    require(error<holdError*.98,"estimated optical flow must improve prediction against future truth");
++    const int64_t lastArrival=100000000+9*333333;
++    require(session.due(lastArrival+83333),"120 Hz optional refresh due after 30 Hz source");
++    t.begin();
++    require(session.record(t.list.Get(),t.queue.Get(),t.fence.Get(),t.value+1,0,{1,1,10},9*333333,lastArrival,lastArrival+83333,true)!=nullptr,"GPU prediction refresh uses observed history without another source");
++    t.finish();session.presented(lastArrival+83333);
++    require(!session.due(lastArrival+83334),"refresh advances absolute deadline");
++    t.begin();
++    require(session.record(t.list.Get(),t.queue.Get(),t.fence.Get(),t.value+1,0,{1,1,10},9*333333,lastArrival,lastArrival+1000000,true)==nullptr,"stale source suppresses speculative GPU output");
++    t.finish();
 +    session.reset();require(!session.due(200000000),"reset clears refresh ownership");
 +    t.checkDebug();std::cout<<"GPU DIS + capture prediction integration PASS (WARP, not Radeon performance)\n";return 0;
 +}catch(const std::exception& error){std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}

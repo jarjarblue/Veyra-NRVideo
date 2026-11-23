@@ -1,3 +1,5 @@
+> Historical core milestone. Current player integration, operation and limits are described in [CAPTURE_PREDICTION_PLAYER.md](CAPTURE_PREDICTION_PLAYER.md). The statements below describe the earlier core-only delivery.
+
 # GPU capture prediction: first development milestone
 
 Target: PS5 HDMI capture viewed on an RX 7900 XT, currently using 30 Hz content

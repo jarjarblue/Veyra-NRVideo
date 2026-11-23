@@ -42,9 +42,9 @@ jobs:
         run: |
           python scripts/ci/prepare-capture-build.py
           cmake -S . -B out/capture-ci/build -DVEYRA_DISPLAY_VERSION=2.1.9-gpu-capture-prediction
-      - name: Build the complete player and prediction tests
+      - name: Build prediction engine and GPU tests
         timeout-minutes: 15
-        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests veyra_capture_prediction_preferences_tests veyra_qml_quick_tests
+        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_capture_prediction_tests veyra_capture_prediction_gpu_tests veyra_capture_prediction_session_tests
       - name: Verify controller and actual estimated-motion prediction
         timeout-minutes: 5
         run: |
@@ -55,7 +55,11 @@ jobs:
           out/capture-ci/build/veyra_capture_prediction_gpu_tests.exe
           out/capture-ci/build/veyra_capture_prediction_session_tests.exe
           python -B scripts/i18n/extract.py --check
+      - name: Build the complete player and control tests
+        timeout-minutes: 15
+        run: cmake --build out/capture-ci/build --parallel 2 --target veyra_qml_ui veyra_capture_prediction_preferences_tests veyra_qml_quick_tests
       - name: Verify controls and ownership
+        timeout-minutes: 5
         env:
           QT_QUICK_BACKEND: software
           QT_QPA_PLATFORM: offscreen
