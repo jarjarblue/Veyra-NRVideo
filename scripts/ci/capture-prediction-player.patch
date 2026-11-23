@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 866cb0e..cc953ba 100644
+index 866cb0e..610fce3 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -348,6 +348,7 @@ veyra_add_compute_shader(veyra_shader_nr_reuse_warp NrReuseWarp)
@@ -19,7 +19,7 @@ index 866cb0e..cc953ba 100644
    add_executable(veyra_playlist_tests tests/unit/PlaylistModelTests.cpp src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h)
    set_target_properties(veyra_playlist_tests PROPERTIES AUTOMOC ON)
    target_compile_features(veyra_playlist_tests PRIVATE cxx_std_20)
-@@ -1553,6 +1556,14 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+@@ -1553,6 +1556,15 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
  
    # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
    add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
@@ -27,6 +27,7 @@ index 866cb0e..cc953ba 100644
 +  add_executable(veyra_capture_prediction_session_tests tests/integration/CapturePredictionSessionTests.cpp
 +    src/engine/CapturePredictionSession.cpp src/guidance/GpuDisOpticalFlow.cpp
 +    third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
++  target_compile_definitions(veyra_capture_prediction_session_tests PRIVATE VEYRA_DIS_DIAGNOSTIC=1)
 +  target_include_directories(veyra_capture_prediction_session_tests PRIVATE third_party/gpu-dis/src/gpu)
 +  target_link_libraries(veyra_capture_prediction_session_tests PRIVATE veyra_capture_prediction dxguid)
 +  target_link_libraries(veyra_engine PUBLIC veyra_capture_prediction)
@@ -34,7 +35,7 @@ index 866cb0e..cc953ba 100644
    target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
      src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
    target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
-@@ -1560,6 +1571,8 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
+@@ -1560,6 +1572,8 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
    veyra_add_compute_shader(veyra_shader_gpu_dis_luma GpuDisLuma)
    veyra_add_compute_shader(veyra_shader_gpu_dis_validate GpuDisValidate)
    add_dependencies(veyra_pipeline veyra_shader_gpu_dis veyra_shader_gpu_dis_luma veyra_shader_gpu_dis_validate)
@@ -773,10 +774,20 @@ index 8e4a2e1..1c3d5c6 100644
  CommandSlotRing::~CommandSlotRing()
  {
 diff --git a/src/guidance/GpuDisOpticalFlow.cpp b/src/guidance/GpuDisOpticalFlow.cpp
-index a58f9a5..2a77ae8 100644
+index a58f9a5..73066c0 100644
 --- a/src/guidance/GpuDisOpticalFlow.cpp
 +++ b/src/guidance/GpuDisOpticalFlow.cpp
-@@ -55,7 +55,7 @@ bool GpuDisOpticalFlow::dispatch(ID3D12GraphicsCommandList* list,ID3D12CommandQu
+@@ -3,6 +3,9 @@
+ #include "gpu_frame_contract.h"
+ #include "native_strict_dis_provider.h"
+ 
++#ifdef VEYRA_DIS_DIAGNOSTIC
++extern "C" void veyra_prediction_test_dispatch(const char*);
++#endif
+ namespace veyra::guidance {
+ using namespace pipeline;
+ struct GpuDisOpticalFlow::Impl {
+@@ -55,12 +58,15 @@ bool GpuDisOpticalFlow::dispatch(ID3D12GraphicsCommandList* list,ID3D12CommandQu
      ID3D12Resource* inputs[]={previous,current};
      for(UINT i=0;i<2;++i){
          const auto d=inputs[i]->GetDesc();
@@ -785,6 +796,24 @@ index a58f9a5..2a77ae8 100644
          p.srv(s.convert,i,inputs[i]);
          states.transition(list,inputs[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
          states.transition(list,s.luma[i].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         s.convert.bind(list,reinterpret_cast<const float*>(dims),Impl::gpu(s.convert,i),Impl::gpu(s.convert,2+i));
+         list->Dispatch((p.w+15)/16,(p.h+15)/16,1);
++#ifdef VEYRA_DIS_DIAGNOSTIC
++        veyra_prediction_test_dispatch("GpuDisLuma");
++#endif
+         states.transition(list,s.luma[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         states.transition(list,inputs[i],D3D12_RESOURCE_STATE_COMMON);
+     }
+@@ -82,6 +88,9 @@ bool GpuDisOpticalFlow::dispatch(ID3D12GraphicsCommandList* list,ID3D12CommandQu
+     states.transition(list,motion,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);states.transition(list,confidence,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     s.validate.bind(list,reinterpret_cast<const float*>(dims),Impl::gpu(s.validate,0),Impl::gpu(s.validate,4));
+     list->Dispatch((p.w+15)/16,(p.h+15)/16,1);
++    #ifdef VEYRA_DIS_DIAGNOSTIC
++    veyra_prediction_test_dispatch("GpuDisValidate");
++#endif
+     states.transition(list,motion,D3D12_RESOURCE_STATE_COMMON);states.transition(list,confidence,D3D12_RESOURCE_STATE_COMMON);
+     for(auto& r:s.luma)states.transition(list,r.Get(),D3D12_RESOURCE_STATE_COMMON);
+     s.completion=context.completion;
 diff --git a/src/ui/QmlPlayerBridge.cpp b/src/ui/QmlPlayerBridge.cpp
 index 259d216..3ce1dea 100644
 --- a/src/ui/QmlPlayerBridge.cpp
@@ -966,18 +995,26 @@ index fda708a..f8bca75 100644
 +#endif
 diff --git a/tests/integration/CapturePredictionSessionTests.cpp b/tests/integration/CapturePredictionSessionTests.cpp
 new file mode 100644
-index 0000000..cd01ed3
+index 0000000..c6bfc57
 --- /dev/null
 +++ b/tests/integration/CapturePredictionSessionTests.cpp
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,78 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#define VEYRA_PREDICTION_GPU_TEST_HELPERS
 +#include "CapturePredictionGpuTests.cpp"
 +#include "veyra/engine/CapturePredictionSession.h"
++#include <functional>
 +using namespace veyra::engine;
-+int main(int argc,char**) try {
++// Diagnostic-only serial submissions identify failing passes. Normal test and
++// production execute the combined pipeline without these per-pass CPU waits.
++static std::function<void(const char*)> dispatchDiagnostic;
++extern "C" void veyra_prediction_test_dispatch(const char* name){if(dispatchDiagnostic)dispatchDiagnostic(name);}
++int main(int argc,char** argv) try {
 +    const bool copyOnly=argc>1;
 +    Test t;CapturePredictionSession session;
++    if(argc>1&&std::string(argv[1])=="--trace-dis")dispatchDiagnostic=[&](const char* name){
++        std::cout<<"GPU trace "<<name<<std::endl;t.finish();t.begin();
++    };
 +    ComPtr<ID3D12Resource> source[2];
 +    for(auto& r:source)r=makeTexture(t.device.Get(),W,H,DXGI_FORMAT_R8G8B8A8_UNORM,false);
 +    require(session.initialize(t.device.Get(),source[0].Get(),source[1].Get()),"initialize integrated GPU DIS prediction session");
@@ -1152,3 +1189,45 @@ index 0000000..f10ad1d
 +        }
 +    }
 +}
+diff --git a/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp b/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
+index 2e37723..b32ca63 100644
+--- a/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
++++ b/third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp
+@@ -18,6 +18,9 @@
+ #include <stdexcept>
+ #include <utility>
+ 
++#ifdef VEYRA_DIS_DIAGNOSTIC
++extern "C" void veyra_prediction_test_dispatch(const char*);
++#endif
+ namespace xess_gpu { namespace {
+ constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+ constexpr auto kWrite = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+@@ -46,11 +49,17 @@ struct Texture {
+     }
+ };
+ struct Pipeline {
++#ifdef VEYRA_DIS_DIAGNOSTIC
++    std::string diagnosticName;
++#endif
+     ComPtr<ID3D12RootSignature> root;
+     ComPtr<ID3D12PipelineState> state;
+     uint32_t srvs=0,uavs=0,constants=0;
+     void create(ID3D12Device* d,const std::string& file,uint32_t s,uint32_t u,uint32_t n) {
+         srvs=s; uavs=u; constants=n;
++#ifdef VEYRA_DIS_DIAGNOSTIC
++        diagnosticName=file;
++#endif
+         D3D12_DESCRIPTOR_RANGE ranges[2]{};
+         ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors=s;
+         ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors=u;
+@@ -146,6 +155,9 @@ class StrictDis final : public MotionProvider {
+     void dispatch(ID3D12GraphicsCommandList* list,const Pipeline& p,const Binding& b,
+                   const void* constants,uint32_t x,uint32_t y=1) {
+         b.bind(list,p,constants); list->Dispatch(x,y,1); ++shader_dispatches_;
++#ifdef VEYRA_DIS_DIAGNOSTIC
++        veyra_prediction_test_dispatch(p.diagnosticName.c_str());
++#endif
+     }
+     void allocate(Slot& s);
+     void record_image(Slot& s,uint32_t index,const FrameLease& frame,ID3D12GraphicsCommandList* list);
